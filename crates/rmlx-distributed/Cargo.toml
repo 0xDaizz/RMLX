@@ -20,5 +20,6 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+libc = { workspace = true }
 rmlx-nn = { path = "../rmlx-nn" }
 rmlx-rdma = { path = "../rmlx-rdma", features = ["test-utils"] }

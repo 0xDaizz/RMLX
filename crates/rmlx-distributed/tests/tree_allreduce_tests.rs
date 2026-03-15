@@ -178,16 +178,16 @@ fn test_allreduce_auto_small_uses_tree() {
 }
 
 #[test]
-fn test_allreduce_auto_large_uses_ring() {
-    // Data >= 1MB should use ring
+fn test_allreduce_auto_large_uses_mesh_for_small_group() {
+    // With <= 2 ranks, large data uses mesh (ring requires > 2 ranks)
     let hub = MockHub::new();
     let transport: Arc<dyn RdmaTransport> = Arc::new(MockTransport::new(0, hub));
-    let ranks = vec![0u32]; // single rank for simplicity
+    let ranks = vec![0u32]; // single rank
     let large_data = vec![0u8; 1024 * 1024]; // exactly 1MB
 
     let (result, algo) =
         allreduce_auto_with_threshold(&large_data, &ranks, 0, &transport, 1024 * 1024).unwrap();
-    assert_eq!(algo, AllreduceAlgorithm::Ring);
+    assert_eq!(algo, AllreduceAlgorithm::Mesh);
     assert_eq!(result, large_data);
 }
 

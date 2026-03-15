@@ -11,12 +11,13 @@ use crate::context::{ProtectionDomain, RdmaContext};
 use crate::ffi::*;
 use crate::RdmaError;
 
-/// TB5-specific default constants (used as fallback when probe is unavailable)
+/// TB5-specific default constants (used as fallback when probe is unavailable).
+/// CQ/WR depths are aligned with JACCL defaults for interoperability.
 pub const IB_PORT: u8 = 1;
 pub const DEFAULT_GID_INDEX: c_int = 1;
-pub const DEFAULT_CQ_DEPTH: c_int = 8192;
-pub const DEFAULT_MAX_SEND_WR: u32 = 8192;
-pub const DEFAULT_MAX_RECV_WR: u32 = 8192;
+pub const DEFAULT_CQ_DEPTH: c_int = 64; // send(32) + recv(32), matches JACCL
+pub const DEFAULT_MAX_SEND_WR: u32 = 32; // JACCL compatible
+pub const DEFAULT_MAX_RECV_WR: u32 = 32; // JACCL compatible
 pub const MAX_SEND_SGE: u32 = 1;
 pub const MAX_RECV_SGE: u32 = 1;
 
@@ -163,16 +164,29 @@ impl QueuePair {
             DEFAULT_MAX_RECV_WR
         });
 
-        // SAFETY: We zero-initialize the struct and fill in all required fields.
-        let mut init_attr: IbvQpInitAttr = unsafe { std::mem::zeroed() };
-        init_attr.send_cq = cq.raw();
-        init_attr.recv_cq = cq.raw();
-        init_attr.qp_type = qp_type::UC;
-        init_attr.sq_sig_all = 1;
-        init_attr.cap.max_send_wr = max_send_wr;
-        init_attr.cap.max_recv_wr = max_recv_wr;
-        init_attr.cap.max_send_sge = MAX_SEND_SGE;
-        init_attr.cap.max_recv_sge = MAX_RECV_SGE;
+        // JACCL compatible: use MaybeUninit to avoid zeroing unused fields.
+        // macOS TB5 driver may interpret zero values in unused fields as unintended
+        // flags (same pattern as IbvSendWr — commit 084bdce).
+        let mut init_attr_uninit = std::mem::MaybeUninit::<IbvQpInitAttr>::uninit();
+        let init_attr_ptr = init_attr_uninit.as_mut_ptr();
+        // SAFETY: Writing to individual fields of the MaybeUninit allocation via raw pointer.
+        // All fields are initialized before assume_init() is called below.
+        unsafe {
+            (*init_attr_ptr).qp_context = ctx.raw() as *mut std::ffi::c_void;
+            (*init_attr_ptr).send_cq = cq.raw();
+            (*init_attr_ptr).recv_cq = cq.raw();
+            (*init_attr_ptr).srq = std::ptr::null_mut();
+            (*init_attr_ptr).qp_type = qp_type::UC;
+            // JACCL 호환 — 각 WR에서 개별적으로 SIGNALED 설정
+            (*init_attr_ptr).sq_sig_all = 0;
+            (*init_attr_ptr).cap.max_send_wr = max_send_wr;
+            (*init_attr_ptr).cap.max_recv_wr = max_recv_wr;
+            (*init_attr_ptr).cap.max_send_sge = MAX_SEND_SGE;
+            (*init_attr_ptr).cap.max_recv_sge = MAX_RECV_SGE;
+            (*init_attr_ptr).cap.max_inline_data = 0;
+        }
+        // SAFETY: All fields have been initialized above.
+        let mut init_attr = unsafe { init_attr_uninit.assume_init() };
 
         // SAFETY: pd.raw() is a valid ibv_pd pointer, init_attr is fully initialized.
         let qp = unsafe { (lib.create_qp)(pd.raw(), &mut init_attr) };
@@ -194,14 +208,9 @@ impl QueuePair {
                 );
                 DEFAULT_GID_INDEX
             });
-        let mtu = ctx.probe().map(|p| p.mtu).unwrap_or_else(|| {
-            tracing::warn!(
-                target: "rmlx_rdma",
-                default = mtu::MTU_1024,
-                "probe unavailable, using MTU_1024",
-            );
-            mtu::MTU_1024
-        });
+        // Always use MTU_1024 for TB5 compatibility (matches JACCL).
+        // macOS reports active_mtu=4096 but TB5 UC mode is unreliable at larger MTUs.
+        let mtu = mtu::MTU_1024;
 
         Ok(Self {
             qp,
@@ -220,9 +229,9 @@ impl QueuePair {
     /// Query local port attributes and GID, populating local_info.
     ///
     /// Must be called before exchanging QP info with the remote peer.
-    /// PSN is computed as `rank * 1000 + 42` per TB5 convention.
+    /// PSN is fixed to 7 for JACCL compatibility.
     /// Uses probed GID index if available, otherwise falls back to `DEFAULT_GID_INDEX`.
-    pub fn query_local_info(&mut self, ctx: &RdmaContext, rank: u32) -> Result<(), RdmaError> {
+    pub fn query_local_info(&mut self, ctx: &RdmaContext, _rank: u32) -> Result<(), RdmaError> {
         let lib = self.lib;
         let gid_index = ctx
             .probe()
@@ -253,7 +262,8 @@ impl QueuePair {
         }
 
         self.local_info.lid = port_attr.lid;
-        self.local_info.psn = rank * 1000 + 42;
+        // JACCL compatible: all ranks use PSN=7
+        self.local_info.psn = 7;
         // SAFETY: IbvGid union's raw field is always valid to read.
         self.local_info.gid = unsafe { gid.raw };
 
@@ -307,22 +317,28 @@ impl QueuePair {
         attr.dest_qp_num = remote.qpn;
         attr.rq_psn = remote.psn;
 
-        // Address Handle with GRH (required for RoCE over TB5)
-        attr.ah_attr.is_global = 1;
+        // Address Handle
         attr.ah_attr.dlid = remote.lid;
         attr.ah_attr.sl = 0;
         attr.ah_attr.src_path_bits = 0;
         attr.ah_attr.port_num = IB_PORT;
 
-        // SAFETY: Constructing IbvGid union from raw bytes is safe.
-        attr.ah_attr.grh.dgid = unsafe {
-            let mut gid: IbvGid = std::mem::zeroed();
-            gid.raw = remote.gid;
-            gid
-        };
-        attr.ah_attr.grh.sgid_index = self.gid_index as u8;
-        attr.ah_attr.grh.hop_limit = 1;
-        attr.ah_attr.grh.traffic_class = 0;
+        // JACCL 호환: only set is_global when remote GID has non-zero interface_id
+        // JACCL: if (dst.global_identifier.global.interface_id) { is_global=1; ... }
+        let has_interface_id = remote.gid[8..16].iter().any(|&b| b != 0);
+        if has_interface_id {
+            attr.ah_attr.is_global = 1;
+            // SAFETY: Constructing IbvGid union from raw bytes is safe.
+            attr.ah_attr.grh.dgid = unsafe {
+                let mut gid: IbvGid = std::mem::zeroed();
+                gid.raw = remote.gid;
+                gid
+            };
+            attr.ah_attr.grh.sgid_index = self.gid_index as u8;
+            // JACCL 호환: hop_limit = 1
+            attr.ah_attr.grh.hop_limit = 1;
+            attr.ah_attr.grh.traffic_class = 0;
+        }
 
         let mask = qp_attr_mask::STATE
             | qp_attr_mask::AV
@@ -385,6 +401,22 @@ impl QueuePair {
         Ok(())
     }
 
+    /// Transition QP to ERROR state, flushing all pending work requests.
+    ///
+    /// This causes the hardware to generate error completions for all outstanding WRs,
+    /// allowing clean CQ drain before QP destruction. Cleaner than going directly to
+    /// RESET, which silently discards in-flight WRs.
+    pub fn transition_to_error(&self) {
+        unsafe {
+            let mut attr: IbvQpAttr = std::mem::zeroed();
+            attr.qp_state = qp_state::ERR;
+            let ret = (self.lib.modify_qp)(self.qp, &mut attr, qp_attr_mask::STATE);
+            if ret != 0 {
+                eprintln!("[qp] WARNING: transition to ERROR state failed: {ret}");
+            }
+        }
+    }
+
     /// Raw QP pointer (for advanced operations).
     #[allow(dead_code)]
     pub(crate) fn raw(&self) -> *mut IbvQp {
@@ -394,9 +426,18 @@ impl QueuePair {
 
 impl Drop for QueuePair {
     fn drop(&mut self) {
-        // SAFETY: self.qp was obtained from ibv_create_qp and is valid.
         unsafe {
-            (self.lib.destroy_qp)(self.qp);
+            // Transition QP to RESET to release hardware resources before destroy.
+            // This ensures in-flight operations are aborted and the QP's hardware
+            // state is cleaned up, preventing EBUSY on subsequent device opens.
+            let mut attr: IbvQpAttr = std::mem::zeroed();
+            attr.qp_state = qp_state::RESET;
+            let _ = (self.lib.modify_qp)(self.qp, &mut attr, qp_attr_mask::STATE);
+
+            let ret = (self.lib.destroy_qp)(self.qp);
+            if ret != 0 {
+                eprintln!("[qp] WARNING: ibv_destroy_qp returned {ret}");
+            }
         }
     }
 }

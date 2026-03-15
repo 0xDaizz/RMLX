@@ -169,12 +169,15 @@ impl WarmupState {
 
         // RDMA warmup
         let rdma_start = Instant::now();
+        eprintln!("[warmup] rdma_warmup_fn starting...");
         rdma_warmup_fn().map_err(|e| format!("RDMA warmup failed: {e}"))?;
+        eprintln!("[warmup] rdma_warmup_fn done ({:?})", rdma_start.elapsed());
         self.rdma_warmed = true;
         let rdma_dur = rdma_start.elapsed();
 
         // JIT shader pre-compilation
         let mut jit_dur = Duration::ZERO;
+        eprintln!("[warmup] jit_precompile={}", config.jit_precompile);
         if config.jit_precompile {
             let jit_start = Instant::now();
             jit_warmup_fn().map_err(|e| format!("JIT warmup failed: {e}"))?;
@@ -184,6 +187,10 @@ impl WarmupState {
 
         // D18: Threshold calibration — auto-tune CPU/GPU crossover point.
         let mut cal_dur = Duration::ZERO;
+        eprintln!(
+            "[warmup] run_calibration={}, calibrated={}",
+            config.run_calibration, self.calibration.calibrated
+        );
         if config.run_calibration && !self.calibration.calibrated {
             let calibration_gpu = MTLCreateSystemDefaultDevice();
             let cal_start = Instant::now();
@@ -194,7 +201,16 @@ impl WarmupState {
             cal_dur = cal_start.elapsed();
         }
 
-        let bench = Some(run_warmup_bench(None));
+        // Skip warmup bench when calibration is disabled (avoids MTLCreateSystemDefaultDevice hang in SSH)
+        let bench = if config.run_calibration {
+            eprintln!("[warmup] run_warmup_bench starting...");
+            let b = Some(run_warmup_bench(None));
+            eprintln!("[warmup] run_warmup_bench done");
+            b
+        } else {
+            eprintln!("[warmup] run_warmup_bench skipped (calibration disabled)");
+            None
+        };
         self.bench_result = bench.clone();
 
         let result = WarmupResult {

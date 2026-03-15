@@ -4,6 +4,7 @@
 //! libibverbs headers, we load functions at runtime using libloading.
 
 use bytemuck::{Pod, Zeroable};
+use libloading::os::unix::{Library as UnixLibrary, RTLD_GLOBAL, RTLD_NOW};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_void};
 use std::sync::OnceLock;
@@ -113,6 +114,8 @@ pub struct IbvMr {
     pub handle: u32,
     pub lkey: u32,
     pub rkey: u32,
+    /// Trailing padding to match C struct size (48 bytes).
+    _trailing_pad: u32,
 }
 
 /// GID global identifier
@@ -213,6 +216,9 @@ pub struct IbvQpAttr {
     pub alt_timeout: u8,
     _pad: u8,
     pub rate_limit: u32,
+    /// Trailing padding to match C struct size (144 bytes).
+    /// C compiler adds 4 bytes for 8-byte alignment.
+    _trailing_pad: u32,
 }
 
 /// Device attributes (from ibv_query_device)
@@ -340,8 +346,13 @@ pub struct IbvSendWr {
     pub wr: IbvWrUnion,
     /// Trailing qp_type union (covers xrc.remote_srqn, 4 bytes).
     _qp_type_pad: u32,
-    /// Safety margin for platform-specific trailing fields or future extensions.
-    _trailing_pad: [u8; 4],
+    /// Padding to match 8-byte alignment after _qp_type_pad.
+    _align_pad: [u8; 4],
+    /// Covers the C bind_mw/tso union (48 bytes) that follows qp_type in macOS
+    /// verbs.h. Without this, the struct is 80 bytes while the driver reads 128.
+    /// The driver copies the full 128-byte ibv_send_wr into the send queue;
+    /// reading past 80 bytes corrupts the WQE and prevents CQ completions.
+    _bind_mw_tso_pad: [u8; 48],
 }
 
 /// Receive work request
@@ -554,14 +565,21 @@ impl IbverbsLib {
             // Try short name first (works when librdma.dylib is on DYLD_LIBRARY_PATH or
             // in the dyld shared cache). Fall back to absolute path for macOS Big Sur+
             // where /usr/lib dylibs only exist in the shared cache.
-            let lib = Library::new("librdma.dylib")
+            // Use RTLD_NOW | RTLD_GLOBAL to match MLX/JACCL behavior.
+            // RTLD_LAZY | RTLD_LOCAL (libloading default) causes ibv_get_device_name()
+            // to hang on non-first devices on macOS.
+            let flags = RTLD_NOW | RTLD_GLOBAL;
+            let lib: Library = UnixLibrary::open(Some("librdma.dylib"), flags)
+                .map(Library::from)
                 .or_else(|e1| {
                     eprintln!("[rmlx-rdma] dlopen(librdma.dylib) failed: {e1}, trying /usr/lib/librdma.dylib");
-                    Library::new("/usr/lib/librdma.dylib")
+                    UnixLibrary::open(Some("/usr/lib/librdma.dylib"), flags)
+                        .map(Library::from)
                 })
                 .or_else(|e2| {
                     eprintln!("[rmlx-rdma] dlopen(/usr/lib/librdma.dylib) failed: {e2}, trying /usr/lib/rdma/libibverbs.dylib");
-                    Library::new("/usr/lib/rdma/libibverbs.dylib")
+                    UnixLibrary::open(Some("/usr/lib/rdma/libibverbs.dylib"), flags)
+                        .map(Library::from)
                 })?;
 
             // Helper macro to load a symbol with an explicit type
@@ -685,6 +703,10 @@ const _: () = {
     assert!(std::mem::size_of::<IbvSge>() == 16);
     // IbvWc: must be at least 48 bytes to cover all C fields.
     assert!(std::mem::size_of::<IbvWc>() >= 48);
+    // IbvQpAttr: C struct is exactly 144 bytes on 64-bit platforms.
+    assert!(std::mem::size_of::<IbvQpAttr>() >= 144);
+    // IbvMr: C struct is exactly 48 bytes on 64-bit platforms.
+    assert!(std::mem::size_of::<IbvMr>() >= 48);
 };
 
 // Verify critical field offsets match C ABI (wr_id must always be at offset 0).

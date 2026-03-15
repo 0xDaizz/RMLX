@@ -1,9 +1,23 @@
 //! RDMA device context and protection domain management
 
-use std::ffi::CStr;
+use std::ffi::{c_int, CStr};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::ffi::{IbvContext, IbvDeviceAttr, IbvPd, IbvPortAttr, IbverbsLib};
 use crate::RdmaError;
+
+/// Process-lifetime singleton for the default RDMA context.
+/// Never deallocated — prevents TB5 driver PD leak on macOS.
+///
+/// Uses `OnceLock<Arc<T>>` with a `Mutex` guard for fallible initialization
+/// (stable Rust lacks `OnceLock::get_or_try_init`).
+static GLOBAL_CTX: OnceLock<Arc<RdmaContext>> = OnceLock::new();
+static GLOBAL_CTX_INIT: Mutex<()> = Mutex::new(());
+
+/// Process-lifetime singleton for the default protection domain.
+/// Never deallocated — prevents TB5 driver PD leak on macOS.
+static GLOBAL_PD: OnceLock<Arc<ProtectionDomain>> = OnceLock::new();
+static GLOBAL_PD_INIT: Mutex<()> = Mutex::new(());
 
 /// RDMA device context — wraps ibv_context.
 /// Owns the context and closes it on drop.
@@ -16,13 +30,19 @@ pub struct RdmaContext {
 
 impl RdmaContext {
     /// Open the first available RDMA device.
+    ///
+    /// If `RMLX_RDMA_DEVICE` is set, opens that device by name instead.
     pub fn open_default() -> Result<Self, RdmaError> {
+        if let Ok(name) = std::env::var("RMLX_RDMA_DEVICE") {
+            return Self::open_by_name(&name);
+        }
+
         let lib = IbverbsLib::load()?;
 
         // SAFETY: ibv_get_device_list returns a null-terminated array.
         // We check for null and num_devices > 0.
         unsafe {
-            let mut num_devices: std::ffi::c_int = 0;
+            let mut num_devices: c_int = 0;
             let dev_list = (lib.get_device_list)(&mut num_devices);
             if dev_list.is_null() || num_devices == 0 {
                 if !dev_list.is_null() {
@@ -108,15 +128,20 @@ impl RdmaContext {
 
     /// Open a specific RDMA device by name (e.g., "mlx5_0").
     ///
-    /// Iterates through all available RDMA devices and opens the one whose
-    /// name matches `name`. Returns an error if no device with that name exists.
+    /// Uses `ibv_devices` CLI to discover the device index, then opens it
+    /// directly — avoiding `ibv_get_device_name()` which can hang on
+    /// PORT_DOWN devices on macOS.
     pub fn open_by_name(name: &str) -> Result<Self, RdmaError> {
+        // Step 1: Find device index via `ibv_devices` CLI output (safe, no hang)
+        let index = find_device_index_by_cli(name)?;
+
+        // Step 2: Open the device directly by index (no iteration needed)
         let lib = IbverbsLib::load()?;
 
         // SAFETY: ibv_get_device_list returns a null-terminated array.
-        // We check for null and num_devices > 0.
+        // We access by the index discovered from CLI, skipping ibv_get_device_name.
         unsafe {
-            let mut num_devices: std::ffi::c_int = 0;
+            let mut num_devices: c_int = 0;
             let dev_list = (lib.get_device_list)(&mut num_devices);
             if dev_list.is_null() || num_devices == 0 {
                 if !dev_list.is_null() {
@@ -125,30 +150,16 @@ impl RdmaContext {
                 return Err(RdmaError::NoDevices);
             }
 
-            // Iterate through the device list to find the named device.
-            let mut found_device = std::ptr::null_mut();
-            for i in 0..num_devices as isize {
-                let device = *dev_list.offset(i);
-                if device.is_null() {
-                    break;
-                }
-                let name_ptr = (lib.get_device_name)(device);
-                if !name_ptr.is_null() {
-                    let dev_name = CStr::from_ptr(name_ptr).to_string_lossy();
-                    if dev_name == name {
-                        found_device = device;
-                        break;
-                    }
-                }
-            }
-
-            if found_device.is_null() {
+            if index >= num_devices as usize {
                 (lib.free_device_list)(dev_list);
-                return Err(RdmaError::DeviceOpen(format!("device '{name}' not found")));
+                return Err(RdmaError::DeviceOpen(format!(
+                    "device '{name}' index {index} out of range ({num_devices} devices)"
+                )));
             }
 
+            let device = *dev_list.add(index);
             let device_name = name.to_string();
-            let ctx = (lib.open_device)(found_device);
+            let ctx = (lib.open_device)(device);
             (lib.free_device_list)(dev_list);
 
             if ctx.is_null() {
@@ -215,6 +226,41 @@ impl RdmaContext {
         }
     }
 
+    /// Get the global singleton RDMA context, opening the default device if needed.
+    ///
+    /// The context is kept alive for the entire process lifetime to prevent
+    /// TB5 driver PD leak on repeated open/close cycles.
+    pub fn get_or_open_default() -> Result<Arc<Self>, RdmaError> {
+        if let Some(ctx) = GLOBAL_CTX.get() {
+            return Ok(Arc::clone(ctx));
+        }
+        // Serialize fallible initialization — only one thread attempts open_default.
+        let _guard = GLOBAL_CTX_INIT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ctx) = GLOBAL_CTX.get() {
+            return Ok(Arc::clone(ctx));
+        }
+        let ctx = Arc::new(Self::open_default()?);
+        let _ = GLOBAL_CTX.set(Arc::clone(&ctx));
+        Ok(ctx)
+    }
+
+    /// Get the global singleton PD, allocating from this context if needed.
+    ///
+    /// The PD is never deallocated — the `OnceLock` holds an `Arc` reference
+    /// forever, so the `Drop` impl never runs. This prevents TB5 driver PD leak.
+    pub fn get_or_alloc_pd(self: &Arc<Self>) -> Result<Arc<ProtectionDomain>, RdmaError> {
+        if let Some(pd) = GLOBAL_PD.get() {
+            return Ok(Arc::clone(pd));
+        }
+        let _guard = GLOBAL_PD_INIT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pd) = GLOBAL_PD.get() {
+            return Ok(Arc::clone(pd));
+        }
+        let pd = Arc::new(self.alloc_pd()?);
+        let _ = GLOBAL_PD.set(Arc::clone(&pd));
+        Ok(pd)
+    }
+
     /// Device name (e.g., "mlx5_0" or TB5 device name).
     pub fn device_name(&self) -> &str {
         &self.device_name
@@ -258,6 +304,9 @@ impl Drop for RdmaContext {
 // SAFETY: RdmaContext holds a raw pointer to a thread-safe ibverbs context.
 // ibverbs contexts are safe to share across threads.
 unsafe impl Send for RdmaContext {}
+// SAFETY: RdmaContext's public API is &self-only (no interior mutation of the
+// raw pointer).  The ibverbs context handle itself is thread-safe.
+unsafe impl Sync for RdmaContext {}
 
 /// Protection domain — wraps ibv_pd.
 pub struct ProtectionDomain {
@@ -280,14 +329,34 @@ impl ProtectionDomain {
 impl Drop for ProtectionDomain {
     fn drop(&mut self) {
         // SAFETY: pd was obtained from ibv_alloc_pd and is valid.
+        // Retry up to 3 times — TB5 macOS driver has known PD leak issues where
+        // dealloc can transiently fail if MR cleanup hasn't fully propagated.
         unsafe {
-            (self.lib.dealloc_pd)(self.pd);
+            let mut ret = (self.lib.dealloc_pd)(self.pd);
+            if ret != 0 {
+                for attempt in 1..=3 {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    ret = (self.lib.dealloc_pd)(self.pd);
+                    if ret == 0 {
+                        eprintln!("[pd] ibv_dealloc_pd succeeded on retry {attempt}");
+                        break;
+                    }
+                }
+                if ret != 0 {
+                    eprintln!(
+                        "[pd] WARNING: ibv_dealloc_pd returned {ret} after 3 retries — PD leaked"
+                    );
+                }
+            }
         }
     }
 }
 
 // SAFETY: PD is an opaque handle safe to share across threads.
 unsafe impl Send for ProtectionDomain {}
+// SAFETY: ProtectionDomain's public API is &self-only (no interior mutation).
+// The ibverbs PD handle itself is thread-safe.
+unsafe impl Sync for ProtectionDomain {}
 
 /// Runtime-probed RDMA device capabilities.
 ///
@@ -388,28 +457,59 @@ impl RdmaDeviceProbe {
         })
     }
 
-    /// Find a valid GID index by probing. Prefers index 1 (RoCE on TB5).
+    /// Find a valid GID index by probing.
+    ///
+    /// Prefers a non-link-local IPv4-mapped GID (e.g. `10.254.0.x` set by
+    /// `auto_setup`) over a link-local one (`169.254.x.x`).  Falls back to
+    /// index 1 → 0 if no such GID exists.
     fn probe_gid_index(ctx: &RdmaContext, port: u8, gid_tbl_len: u32) -> Result<u32, RdmaError> {
+        use std::os::raw::c_int;
         let lib = ctx.lib();
 
-        // Try index 1 first (TB5 RoCE convention)
+        // Phase 1: Find a non-link-local IPv4-mapped GID (preferred for RDMA over TB5)
+        for idx in 0..gid_tbl_len {
+            let mut gid: crate::ffi::IbvGid = unsafe { std::mem::zeroed() };
+            let ret = unsafe { (lib.query_gid)(ctx.raw(), port, idx as c_int, &mut gid) };
+            if ret != 0 {
+                continue;
+            }
+            let raw = unsafe { gid.raw };
+            // Check IPv4-mapped format: ::ffff:x.x.x.x
+            let is_ipv4_mapped = raw[..10] == [0u8; 10] && raw[10] == 0xff && raw[11] == 0xff;
+            if !is_ipv4_mapped {
+                continue;
+            }
+            // Skip link-local (169.254.x.x)
+            if raw[12] == 0xa9 && raw[13] == 0xfe {
+                continue;
+            }
+            // Found a non-link-local IPv4 GID
+            eprintln!(
+                "[rdma] probe_gid_index: selected index {idx} (IP={}.{}.{}.{})",
+                raw[12], raw[13], raw[14], raw[15]
+            );
+            return Ok(idx);
+        }
+
+        // Phase 2: Fall back to any non-zero GID (try index 1 first for TB5 convention)
         if gid_tbl_len > 1 {
             let mut gid: crate::ffi::IbvGid = unsafe { std::mem::zeroed() };
             let ret = unsafe { (lib.query_gid)(ctx.raw(), port, 1, &mut gid) };
             if ret == 0 {
-                // Verify it's not all-zeros
                 let raw = unsafe { gid.raw };
                 if raw.iter().any(|&b| b != 0) {
+                    eprintln!("[rdma] probe_gid_index: fallback to index 1");
                     return Ok(1);
                 }
             }
         }
 
-        // Fall back to index 0
+        // Phase 3: Fall back to index 0
         if gid_tbl_len > 0 {
             let mut gid: crate::ffi::IbvGid = unsafe { std::mem::zeroed() };
             let ret = unsafe { (lib.query_gid)(ctx.raw(), port, 0, &mut gid) };
             if ret == 0 {
+                eprintln!("[rdma] probe_gid_index: fallback to index 0");
                 return Ok(0);
             }
         }
@@ -418,4 +518,46 @@ impl RdmaDeviceProbe {
             "no valid GID index found".to_string(),
         ))
     }
+}
+
+/// Find the index of a device in the `ibv_devices` CLI output.
+///
+/// This avoids calling `ibv_get_device_name()` via the C API, which can hang
+/// on PORT_DOWN devices on macOS. The CLI lists devices in the same order as
+/// `ibv_get_device_list()`, so the positional index is stable.
+fn find_device_index_by_cli(name: &str) -> Result<usize, RdmaError> {
+    let output = std::process::Command::new("ibv_devices")
+        .output()
+        .map_err(|e| RdmaError::DeviceOpen(format!("ibv_devices failed: {e}")))?;
+
+    if !output.status.success() {
+        return Err(RdmaError::DeviceOpen(
+            "ibv_devices returned non-zero".into(),
+        ));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Parse output like:
+    //     device              node GUID
+    //     ------          ----------------
+    //     rdma_en2        b003616e7ef2ac05
+    //     rdma_en3        b103616e7ef2ac05
+    //     rdma_en5        b303616e7ef2ac05
+
+    let mut index = 0usize;
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("device") || trimmed.starts_with("------") || trimmed.is_empty() {
+            continue;
+        }
+        let dev_name = trimmed.split_whitespace().next().unwrap_or("");
+        if dev_name == name {
+            return Ok(index);
+        }
+        index += 1;
+    }
+
+    Err(RdmaError::DeviceOpen(format!(
+        "device '{name}' not found in ibv_devices output"
+    )))
 }

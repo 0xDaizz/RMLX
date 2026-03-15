@@ -204,7 +204,7 @@ impl SlabRing {
             let prod = self.producer_pos.load(Ordering::Acquire);
             let cons = self.consumer_pos.load(Ordering::Acquire);
 
-            if prod - cons >= self.depth as u64 {
+            if prod.wrapping_sub(cons) >= self.depth as u64 {
                 return Err(SlabRingError::Full);
             }
 
@@ -403,7 +403,7 @@ impl SlabRing {
     pub fn in_flight(&self) -> usize {
         let prod = self.producer_pos.load(Ordering::Acquire);
         let cons = self.consumer_pos.load(Ordering::Acquire);
-        (prod - cons) as usize
+        prod.wrapping_sub(cons) as usize
     }
 
     /// Whether the ring is empty (no slabs waiting for consumption).

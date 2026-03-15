@@ -2,6 +2,7 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+pub mod auto_setup;
 pub mod collectives;
 pub mod connection;
 pub mod connection_manager;
@@ -30,8 +31,8 @@ pub use collectives::{
 };
 pub mod crc;
 pub use connection::{
-    CompletionTracker, PostedOp, PostedOpKind, RdmaConfig, RdmaConnection, RegisteredRecv,
-    RegisteredSend,
+    CompletionTracker, PostedOp, PostedOpKind, RdmaBufferPool, RdmaConfig, RdmaConnection,
+    RegisteredRecv, RegisteredSend, SharedRdmaBuffer,
 };
 #[allow(deprecated)]
 pub use connection_manager::ConnectionManager;

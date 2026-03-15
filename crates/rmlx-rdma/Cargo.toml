@@ -25,3 +25,4 @@ parking_lot = { workspace = true }
 rustc-hash = { workspace = true }
 crossbeam-utils = { workspace = true }
 bytemuck = { workspace = true }
+serde_json = { workspace = true }

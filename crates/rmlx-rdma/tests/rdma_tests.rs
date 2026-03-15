@@ -97,9 +97,9 @@ fn test_probe_values_flow_to_cq_qp() {
     };
 
     assert_eq!(DEFAULT_GID_INDEX, 1);
-    assert_eq!(DEFAULT_CQ_DEPTH, 8192);
-    assert_eq!(DEFAULT_MAX_SEND_WR, 8192);
-    assert_eq!(DEFAULT_MAX_RECV_WR, 8192);
+    assert_eq!(DEFAULT_CQ_DEPTH, 64);
+    assert_eq!(DEFAULT_MAX_SEND_WR, 32);
+    assert_eq!(DEFAULT_MAX_RECV_WR, 32);
     assert_eq!(DEFAULT_MAX_MR_SIZE, 16 * 1024 * 1024);
 }
 

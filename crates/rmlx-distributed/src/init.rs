@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rmlx_rdma::connection::{RdmaConfig, RdmaConnection};
+use rmlx_rdma::connection::{RdmaBufferPool, RdmaConfig, RdmaConnection};
 use rmlx_rdma::context::RdmaContext;
 use rmlx_rdma::coordinator::CoordinatorConfig;
 use rmlx_rdma::device_file::DeviceMap;
@@ -28,7 +28,7 @@ use rmlx_rdma::qp::{CompletionQueue, QpInfo, QueuePair};
 
 use crate::group::{DistributedError, Group};
 use crate::transport::RdmaConnectionTransport;
-use crate::warmup::{WarmupConfig, WarmupResult, WarmupState};
+use crate::warmup::WarmupResult;
 
 // ── Public types ──
 
@@ -261,8 +261,16 @@ fn try_rdma_init(
         .or_else(|| parse_env_u32("RMLX_COORDINATOR_PORT").and_then(|p| u16::try_from(p).ok()))
         .unwrap_or(rmlx_rdma::coordinator::COORDINATOR_PORT);
 
-    // Load device file for per-peer device selection
+    // Load device file for per-peer device selection.
     let device_map = load_device_map(config);
+    eprintln!("[rdma-init] device_map loaded: {}", device_map.is_some());
+    if device_map.is_none() {
+        return Err(DistributedError::Config(
+            "RDMA device file required but not found. \
+             Run rdma_setup.py first, then set RMLX_IBV_DEVICES=<path>."
+                .to_string(),
+        ));
+    }
     if let Some(ref dm) = device_map {
         if dm.world_size() != world_size as usize {
             return Err(DistributedError::Config(format!(
@@ -321,10 +329,11 @@ fn try_rdma_init(
     // qps[peer] holds (ctx, pd, cq, qp) for each peer slot.
     // For self-rank, we create a dummy QP (no connect needed).
     struct QpSlot {
-        ctx: RdmaContext,
-        pd: rmlx_rdma::context::ProtectionDomain,
+        ctx: Arc<RdmaContext>,
+        pd: Arc<rmlx_rdma::context::ProtectionDomain>,
         cq: CompletionQueue,
         qp: QueuePair,
+        pool: Option<RdmaBufferPool>,
     }
 
     let mut slots: Vec<Option<QpSlot>> = (0..world_size).map(|_| None).collect();
@@ -338,26 +347,48 @@ fn try_rdma_init(
         world_size as usize
     ];
 
+    eprintln!("[rdma-init] Phase 1a: creating QPs...");
     for peer in 0..world_size {
-        let ctx = open_ctx(peer)?;
-        let pd = ctx
-            .alloc_pd()
-            .map_err(|e| DistributedError::Transport(e.to_string()))?;
+        if peer == rank {
+            // Self-slot: no RDMA context needed.  Opening the same RDMA device
+            // twice in one process causes ibv_open_device() to hang on macOS.
+            // local_infos[rank] stays zeroed; slots[rank] stays None.
+            continue;
+        }
+
+        // Use singleton context/PD to prevent TB5 driver PD leak on macOS.
+        // open_ctx() is kept for device_map routing; we wrap in Arc for the slot.
+        let ctx = Arc::new(open_ctx(peer)?);
+        let pd = Arc::new(
+            ctx.alloc_pd()
+                .map_err(|e| DistributedError::Transport(e.to_string()))?,
+        );
         let cq =
             CompletionQueue::new(&ctx).map_err(|e| DistributedError::Transport(e.to_string()))?;
         let mut qp = QueuePair::create_uc(&pd, &cq, &ctx)
             .map_err(|e| DistributedError::Transport(e.to_string()))?;
 
-        if peer != rank {
-            // Query local info so we have (lid, qpn, psn, gid) to share.
-            qp.query_local_info(&ctx, rank)
-                .map_err(|e| DistributedError::Transport(e.to_string()))?;
-            local_infos[peer as usize] = qp.local_info().clone();
-        }
-        // Self-slot: local_infos[rank] stays zeroed (never used by peers).
+        // Query local info so we have (lid, qpn, psn, gid) to share.
+        qp.query_local_info(&ctx, rank)
+            .map_err(|e| DistributedError::Transport(e.to_string()))?;
+        local_infos[peer as usize] = qp.local_info().clone();
 
-        slots[peer as usize] = Some(QpSlot { ctx, pd, cq, qp });
+        // JACCL pattern: register MR before QP connect (QP is in RESET state)
+        let pool = RdmaBufferPool::new(&pd)
+            .inspect_err(|e| {
+                eprintln!("[rdma-init] WARNING: buffer pool alloc failed for peer={peer}: {e}")
+            })
+            .ok();
+
+        slots[peer as usize] = Some(QpSlot {
+            ctx,
+            pd,
+            cq,
+            qp,
+            pool,
+        });
     }
+    eprintln!("[rdma-init] Phase 1a complete, starting coordinator exchange...");
 
     // Phase 1b: Pack local QP infos and all_gather via coordinator.
     // Wire format: world_size * 26 bytes (lid:2 + qpn:4 + psn:4 + gid:16).
@@ -424,19 +455,21 @@ fn try_rdma_init(
     let mut connections: Vec<Option<RdmaConnection>> = (0..world_size).map(|_| None).collect();
 
     for peer in 0..world_size {
+        if peer == rank {
+            // Self-slot stays None — no RDMA connection to self.
+            continue;
+        }
+
         let slot = slots[peer as usize]
             .take()
             .expect("QP slot should be populated");
 
-        if peer != rank {
-            // Connect this QP to the peer's QP that was created for us.
-            slot.qp
-                .connect(&remote_for_me[peer as usize])
-                .map_err(|e| {
-                    DistributedError::Transport(format!("QP connect to rank {peer} failed: {e}"))
-                })?;
-        }
-        // Self-slot: leave unconnected (placeholder for transport indexing).
+        // Connect this QP to the peer's QP that was created for us.
+        slot.qp
+            .connect(&remote_for_me[peer as usize])
+            .map_err(|e| {
+                DistributedError::Transport(format!("QP connect to rank {peer} failed: {e}"))
+            })?;
 
         let peer_config = RdmaConfig {
             rank,
@@ -457,18 +490,28 @@ fn try_rdma_init(
             slot.cq,
             slot.qp,
             peer_config,
+            slot.pool,
         ));
     }
 
-    // Unwrap all Options — every slot should be populated now.
-    let connections: Vec<RdmaConnection> = connections
-        .into_iter()
-        .enumerate()
-        .map(|(i, c)| {
-            c.ok_or_else(|| DistributedError::Transport(format!("missing connection for rank {i}")))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    // Post-connect barrier: ensure all ranks have completed QP state transitions
+    // (RESET → INIT → RTR → RTS) before any RDMA operation. Without this,
+    // rank 0 may send before rank 1's QP is in RTS, causing UC silent drop.
+    // JACCL does this with side_channel.all_gather<int>(0) after QP connect.
+    eprintln!("[rdma-init] Post-connect barrier via coordinator...");
+    let barrier_buf = vec![rank as u8; 1];
+    let hub_host_barrier = if rank == 0 { "" } else { &coordinator_addr };
+    let _barrier_result = rmlx_rdma::coordinator::all_gather_bytes(
+        rank,
+        world_size,
+        &barrier_buf,
+        hub_host_barrier,
+        &coord_cfg,
+    )
+    .map_err(|e| DistributedError::Transport(format!("post-connect barrier failed: {e}")))?;
+    eprintln!("[rdma-init] Post-connect barrier OK");
 
+    // connections[rank] is None (self-slot); all others are Some.
     let transport = RdmaConnectionTransport::new(connections, rank);
     let all_ranks: Vec<u32> = (0..world_size).collect();
     let group = Group::with_transport(all_ranks, rank, world_size, Arc::new(transport))?;
@@ -483,38 +526,7 @@ fn try_rdma_init(
         "connected to peers",
     );
 
-    // ── Warmup: RDMA ping-pong + JIT shader pre-compilation + calibration ──
-    // Run warmup after connection establishment to ensure RDMA paths are hot
-    // and Metal shaders are JIT-compiled before the first real dispatch.
-    let warmup_result = {
-        let mut state = WarmupState::new();
-        let warmup_config = WarmupConfig::default();
-        match state.run_warmup(
-            &warmup_config,
-            // RDMA warmup: no-op for now (connection is already established;
-            // a real warmup would send small test messages to verify paths).
-            || Ok(()),
-            // JIT warmup: no-op (kernel registry is not available at init time;
-            // JIT pre-compilation happens when the kernel registry is first used).
-            || Ok(()),
-        ) {
-            Ok(result) => {
-                tracing::info!(
-                    target: "rmlx_distributed",
-                    rdma_warmup = ?result.rdma_warmup,
-                    jit_warmup = ?result.jit_warmup,
-                    calibration = ?result.calibration,
-                    total = ?result.total,
-                    "warmup complete",
-                );
-                Some(result)
-            }
-            Err(e) => {
-                tracing::warn!(target: "rmlx_distributed", %e, "warmup failed (non-fatal)");
-                None
-            }
-        }
-    };
+    let warmup_result: Option<WarmupResult> = None;
 
     Ok(DistributedContext {
         group,
