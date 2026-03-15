@@ -1,8 +1,8 @@
 //! 2-node RDMA integration tests.
 //!
 //! Tests 1-5 use a mock LoopbackTransport and can run without real RDMA hardware.
-//! Test 6 (`test_nocopy_send_page_aligned`) requires real RDMA hardware, 2-node setup,
-//! and RMLX_TEST_2NODE=1. Run it via `scripts/test_rdma_2node.sh`.
+//! Tests A1-A5 require real RDMA hardware, 2-node setup, and RMLX_TEST_2NODE=1.
+//! Run them via `scripts/test_rdma_2node.sh`.
 //!
 //! Run with: RMLX_TEST_RDMA=1 cargo test -p rmlx-distributed --test rdma_2node_integration -- --ignored
 
@@ -448,87 +448,265 @@ fn test_allreduce_f16_two_rank_loopback() {
     assert_eq!(result, f16_data);
 }
 
-// ─── Test 6: nocopy send with page-aligned data (requires 2-node RDMA) ───
-// This is a 2-node test that must be run via scripts/test_rdma_2node.sh.
-// Running in single-process mode will skip immediately unless RMLX_TEST_2NODE=1 is set.
+// ─── 2-node RDMA test helpers ───
 
-#[test]
-#[ignore = "requires 2-node RDMA setup; run via scripts/test_rdma_2node.sh"]
-fn test_nocopy_send_page_aligned() {
-    if skip_unless_rdma() {
-        return;
+use rmlx_distributed::transport::RdmaConnectionTransport;
+use rmlx_rdma::connection::{RdmaConfig, RdmaConnection};
+
+/// Wrap RdmaConnection::establish() in a thread with an overall timeout.
+/// TB5 macOS RDMA driver can hang indefinitely in kernel-level operations
+/// (alloc_pd, create_qp) if previous RDMA resources weren't cleaned up.
+/// This prevents the entire test process from hanging.
+fn establish_with_timeout(config: RdmaConfig, timeout_secs: u64) -> Option<RdmaConnection> {
+    let handle = std::thread::spawn(move || RdmaConnection::establish(config));
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if handle.is_finished() {
+            return match handle.join() {
+                Ok(Ok(conn)) => Some(conn),
+                Ok(Err(e)) => {
+                    eprintln!("establish failed: {e}");
+                    None
+                }
+                Err(_) => {
+                    eprintln!("establish thread panicked");
+                    None
+                }
+            };
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!(
+                "establish timed out after {timeout_secs}s — possible RDMA kernel resource contamination. \
+                 Reboot the node to clear stuck RDMA state."
+            );
+            // Can't join the thread (it's stuck in kernel), just return None.
+            // The thread will be cleaned up when the process exits.
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
-    // This test requires a peer node — skip unless explicitly enabled
+}
+
+/// Set up a raw 2-node RDMA connection (no Group wrapper).
+fn setup_2node_connection() -> Option<(RdmaConnection, u32)> {
     if std::env::var("RMLX_TEST_2NODE").is_err() {
-        eprintln!(
-            "skipping: 2-node test requires RMLX_TEST_2NODE=1 (run via scripts/test_rdma_2node.sh)"
-        );
-        return;
+        eprintln!("skipping: requires RMLX_TEST_2NODE=1");
+        return None;
     }
-
-    use rmlx_rdma::context::RdmaContext;
-
-    // This test requires two nodes connected via RDMA.
-    // It verifies that page-aligned data can be sent via chunked_send.
-    // The test is designed to be run as rank 0 (server side).
-
-    let rank: u32 = std::env::var("RMLX_RANK")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0);
-    let _peer_host = std::env::var("RMLX_PEER_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
-    let _exchange_port: u16 = std::env::var("RMLX_EXCHANGE_PORT")
+    let rank: u32 = std::env::var("RMLX_RANK").ok()?.parse().ok()?;
+    let peer_host = std::env::var("RMLX_PEER_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    let port: u16 = std::env::var("RMLX_TEST_PORT")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(18515);
 
-    let ctx = match RdmaContext::open_default() {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("skipping: cannot open RDMA context: {e}");
-            return;
-        }
+    let config = RdmaConfig {
+        rank,
+        world_size: 2,
+        peer_host,
+        exchange_port: port,
+        sync_port: port + 1,
+        accept_timeout_secs: 5,
+        connect_timeout_ms: 1000,
+        io_max_retries: 1,
+        io_retry_delay_ms: 200,
+        ..Default::default()
     };
-    let pd = ctx.alloc_pd().expect("PD allocation");
 
-    // Allocate page-aligned test data
+    let conn = establish_with_timeout(config, 8)?;
+    Some((conn, rank))
+}
+
+// ─── Subtests: raw connection ───
+
+fn subtest_nocopy_send(conn: &RdmaConnection, rank: u32) {
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-    let data_size = page_size * 4; // 4 pages
-    let mut aligned_ptr: *mut c_void = std::ptr::null_mut();
-    let ret = unsafe { libc::posix_memalign(&mut aligned_ptr, page_size, data_size) };
-    assert_eq!(ret, 0, "posix_memalign failed");
+    let data_size = page_size * 4; // 64KB
 
-    // Fill with test pattern: each byte = (offset % 251) for verification
-    unsafe {
-        let slice = std::slice::from_raw_parts_mut(aligned_ptr as *mut u8, data_size);
-        for (i, byte) in slice.iter_mut().enumerate() {
-            *byte = (i % 251) as u8;
+    if rank == 0 {
+        let mut aligned_ptr: *mut c_void = std::ptr::null_mut();
+        let ret = unsafe { libc::posix_memalign(&mut aligned_ptr, page_size, data_size) };
+        assert_eq!(ret, 0, "posix_memalign failed");
+
+        let send_data = unsafe {
+            let slice = std::slice::from_raw_parts_mut(aligned_ptr as *mut u8, data_size);
+            for (i, byte) in slice.iter_mut().enumerate() {
+                *byte = (i % 251) as u8;
+            }
+            std::slice::from_raw_parts(aligned_ptr as *const u8, data_size)
+        };
+
+        conn.chunked_send(send_data)
+            .expect("nocopy send should succeed");
+
+        unsafe {
+            libc::free(aligned_ptr);
         }
-    }
+        eprintln!("  nocopy send: rank=0 sent {data_size} bytes (page-aligned)");
+    } else {
+        let received = conn
+            .chunked_recv(data_size)
+            .expect("chunked_recv should succeed");
 
-    // Register as nocopy MR
-    let mr = unsafe {
-        rmlx_rdma::MemoryRegion::register_nocopy(&pd, aligned_ptr, data_size)
-            .expect("register_nocopy should succeed")
+        assert_eq!(received.len(), data_size);
+        for (i, &byte) in received.iter().enumerate() {
+            assert_eq!(
+                byte,
+                (i % 251) as u8,
+                "mismatch at offset {i}: expected {}, got {byte}",
+                (i % 251) as u8
+            );
+        }
+        eprintln!("  nocopy send: rank=1 verified {data_size} bytes");
+    }
+}
+
+// ─── Subtests: Group-based allreduce ───
+
+fn subtest_f16_allreduce(group: &Group, rank: u32) {
+    // Rank 0: [1.0, 2.0, ..., 256.0], Rank 1: [256.0, 255.0, ..., 1.0]
+    let f32_vals: Vec<f32> = if rank == 0 {
+        (1..=256).map(|i| i as f32).collect()
+    } else {
+        (1..=256).rev().map(|i| i as f32).collect()
     };
-    assert!(mr.is_nocopy());
+    let data = f32_slice_to_f16_bytes(&f32_vals);
 
-    eprintln!(
-        "test_nocopy_send_page_aligned: rank={rank}, data_size={data_size}, \
-         addr={:?}, lkey={}",
-        mr.addr(),
-        mr.lkey()
-    );
+    let result = group
+        .allreduce_op(&data, ReduceOp::Sum, ReduceDtype::F16)
+        .expect("2-node f16 allreduce should succeed");
 
-    // The actual send/recv requires a connected QP pair across two nodes.
-    // This test validates the MR setup; full send/recv is validated by
-    // rdma_setup.py which orchestrates both ranks.
-
-    // Clean up
-    drop(mr);
-    unsafe {
-        libc::free(aligned_ptr);
+    let result_f32 = f16_bytes_to_f32_vec(&result);
+    assert_eq!(result_f32.len(), 256);
+    for (i, &val) in result_f32.iter().enumerate() {
+        assert!(
+            (val - 257.0).abs() < 0.5,
+            "element {i}: expected ~257.0, got {val}"
+        );
     }
+    eprintln!("  subtest_f16_allreduce: rank={rank} PASSED");
+}
+
+fn subtest_f32_allreduce(group: &Group, rank: u32) {
+    // Rank 0: [1.0, 2.0, ..., 256.0], Rank 1: [256.0, 255.0, ..., 1.0]
+    let f32_vals: Vec<f32> = if rank == 0 {
+        (1..=256).map(|i| i as f32).collect()
+    } else {
+        (1..=256).rev().map(|i| i as f32).collect()
+    };
+    let data = f32_slice_to_bytes(&f32_vals);
+
+    let result = group
+        .allreduce_op(&data, ReduceOp::Sum, ReduceDtype::F32)
+        .expect("2-node f32 allreduce should succeed");
+
+    let result_f32 = f32_bytes_to_vec(&result);
+    assert_eq!(result_f32.len(), 256);
+    for (i, &val) in result_f32.iter().enumerate() {
+        assert!(
+            (val - 257.0).abs() < 1e-4,
+            "element {i}: expected 257.0, got {val}"
+        );
+    }
+    eprintln!("  subtest_f32_allreduce: rank={rank} PASSED");
+}
+
+fn subtest_allreduce_in_place(group: &Group, rank: u32) {
+    let f32_vals: Vec<f32> = if rank == 0 {
+        (1..=256).map(|i| i as f32).collect()
+    } else {
+        (1..=256).rev().map(|i| i as f32).collect()
+    };
+    let mut data = f32_slice_to_f16_bytes(&f32_vals);
+
+    group
+        .allreduce_in_place(&mut data, ReduceDtype::F16)
+        .expect("2-node f16 allreduce_in_place should succeed");
+
+    let result_f32 = f16_bytes_to_f32_vec(&data);
+    assert_eq!(result_f32.len(), 256);
+    for (i, &val) in result_f32.iter().enumerate() {
+        assert!(
+            (val - 257.0).abs() < 0.5,
+            "element {i}: expected ~257.0, got {val}"
+        );
+    }
+    eprintln!("  subtest_allreduce_in_place: rank={rank} PASSED");
+}
+
+fn subtest_large_allreduce(group: &Group, rank: u32) {
+    // 1MB of f16 data = 524288 elements
+    let num_elements: usize = 524288;
+    let f32_vals: Vec<f32> = (0..num_elements)
+        .map(|i| {
+            if rank == 0 {
+                ((i % 100) as f32) * 0.1 // 0.0, 0.1, ..., 9.9, 0.0, ...
+            } else {
+                ((99 - (i % 100)) as f32) * 0.1 // 9.9, 9.8, ..., 0.0, 9.9, ...
+            }
+        })
+        .collect();
+    let data = f32_slice_to_f16_bytes(&f32_vals);
+    assert_eq!(data.len(), num_elements * 2); // 1MB
+
+    let result = group
+        .allreduce_op(&data, ReduceOp::Sum, ReduceDtype::F16)
+        .expect("2-node large f16 allreduce should succeed");
+
+    let result_f32 = f16_bytes_to_f32_vec(&result);
+    assert_eq!(result_f32.len(), num_elements);
+
+    // Verify a subset: every 1000th element
+    // rank0[i] + rank1[i] = (i%100)*0.1 + (99-i%100)*0.1 = 9.9
+    for i in (0..num_elements).step_by(1000) {
+        assert!(
+            (result_f32[i] - 9.9).abs() < 0.15,
+            "element {i}: expected ~9.9, got {}",
+            result_f32[i]
+        );
+    }
+    eprintln!(
+        "  subtest_large_allreduce: rank={rank} PASSED ({num_elements} f16 elements, {}KB)",
+        num_elements * 2 / 1024
+    );
+}
+
+#[test]
+#[ignore = "2-node RDMA test; run via scripts/test_rdma_2node.sh"]
+fn test_2node_full_suite() {
+    let (conn, rank) = match setup_2node_connection() {
+        Some(v) => v,
+        None => return,
+    };
+
+    // Phase 1: Raw connection tests (borrow only)
+    eprintln!("=== Phase 1: nocopy chunked send ===");
+    subtest_nocopy_send(&conn, rank);
+
+    // Phase 2+: Wrap connection as Group for collective tests
+    let peer_rank = 1 - rank;
+    let mut connections: Vec<Option<RdmaConnection>> = vec![None, None];
+    connections[peer_rank as usize] = Some(conn);
+    let transport = Arc::new(RdmaConnectionTransport::new(connections, rank));
+    let group = Group::with_transport(vec![0, 1], rank, 2, transport)
+        .expect("Group creation should succeed");
+
+    eprintln!("=== Phase 2: f16 allreduce ===");
+    subtest_f16_allreduce(&group, rank);
+
+    eprintln!("=== Phase 3: f32 allreduce ===");
+    subtest_f32_allreduce(&group, rank);
+
+    eprintln!("=== Phase 4: allreduce in-place ===");
+    subtest_allreduce_in_place(&group, rank);
+
+    eprintln!("=== Phase 5: large allreduce (1MB f16) ===");
+    subtest_large_allreduce(&group, rank);
+
+    // Exit barrier: ensure both ranks complete before dropping connection
+    let _ = group.allreduce(&[0u8; 4]);
+    eprintln!("=== All phases passed ===");
 }
 
 // ─── Supplementary: f16 conversion helpers correctness ───
