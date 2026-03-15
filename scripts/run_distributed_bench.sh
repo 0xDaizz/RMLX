@@ -7,10 +7,11 @@
 #   ./scripts/run_distributed_bench.sh --ep          # EP benchmark instead of TP
 #
 # Environment:
-#   node0: 10.0.0.1 (rank 0, coordinator)
-#   node1: 10.0.0.2 (rank 1)
+#   RMLX_NODE0/RMLX_NODE1: SSH hostnames (default: node0/node1)
+#   RMLX_NODE0_IP/RMLX_NODE1_IP: Coordinator IPs for RDMA (default: 10.0.0.1/10.0.0.2)
+#   RMLX_REMOTE_DIR: Remote project directory (default: /Users/hw/rmlx)
+#   RMLX_COORDINATOR_PORT: TCP port for QP exchange (default: 18520)
 #   TB5 RDMA: en5, GID_INDEX=1, IB_PORT=1, IBV_QPT_UC
-#   Coordinator port: 18520
 
 set -euo pipefail
 
@@ -18,15 +19,14 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # ─── Configuration ──────────────────────────────────────────────────────────
-NODE0="node0"
-NODE1="node1"
-# Coordinator uses LAN IPs (TCP-based QP exchange)
-# TB5 RDMA (en5) doesn't support TCP/IP — only raw RDMA verbs
-NODE0_IP="10.0.0.1"
-NODE1_IP="10.0.0.2"
-COORDINATOR_PORT=18520
+# Override via environment variables or defaults
+NODE0="${RMLX_NODE0:-node0}"
+NODE1="${RMLX_NODE1:-node1}"
+NODE0_IP="${RMLX_NODE0_IP:-10.0.0.1}"
+NODE1_IP="${RMLX_NODE1_IP:-10.0.0.2}"
+COORDINATOR_PORT="${RMLX_COORDINATOR_PORT:-18520}"
 
-REMOTE_DIR="~/rmlx"
+REMOTE_DIR="${RMLX_REMOTE_DIR:-/Users/hw/rmlx}"
 BENCH_NAME="distributed_bench"
 RESULTS_DIR="$PROJECT_DIR/bench_results"
 
@@ -96,9 +96,9 @@ log "Code synced."
 
 # ─── Build on both machines (parallel) ─────────────────────────────────────
 log "Building on both machines (parallel)..."
-ssh_cmd "$NODE0" "cd $REMOTE_DIR && cargo build --release -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" &
+ssh_cmd "$NODE0" "env -C $REMOTE_DIR cargo build --release -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" &
 PID1=$!
-ssh_cmd "$NODE1" "cd $REMOTE_DIR && cargo build --release -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" &
+ssh_cmd "$NODE1" "env -C $REMOTE_DIR cargo build --release -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" &
 PID2=$!
 
 wait $PID1 || { echo "ERROR: Build failed on $NODE0" >&2; exit 1; }
@@ -111,7 +111,7 @@ TIMESTAMP=$(date '+%Y%m%d_%H%M%S')
 
 # ─── Run single-node baseline on node0 first ──────────────────────────
 log "Running single-node baseline on $NODE0..."
-ssh_cmd "$NODE0" "cd $REMOTE_DIR && \
+ssh_cmd "$NODE0" "env -C $REMOTE_DIR \
     cargo bench -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" \
     | tee "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_baseline_node0.txt"
 
@@ -122,14 +122,15 @@ log "  Rank 1:               $NODE1 ($NODE1_IP)"
 
 # Environment variables for distributed init (rmlx_distributed::init)
 # Uses RMLX_COORDINATOR for coordinator-mediated QP exchange
-COMMON_ENV="RMLX_WORLD_SIZE=2 \
+COMMON_ENV="RMLX_RDMA_DEVICE=rdma_en5 \
+RMLX_WORLD_SIZE=2 \
 RMLX_COORDINATOR=$NODE0_IP \
 RMLX_COORDINATOR_PORT=$COORDINATOR_PORT \
 RMLX_IBV_DEVICES=$REMOTE_DIR/config/devices_tb5.json"
 
 # Start rank 1 first (it will connect to rank 0's coordinator)
 log "Starting rank 1 on $NODE1..."
-ssh_cmd "$NODE1" "cd $REMOTE_DIR && \
+ssh_cmd "$NODE1" "env -C $REMOTE_DIR \
     RMLX_RANK=1 $COMMON_ENV \
     cargo bench -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" \
     > "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_tp2_rank1.txt" 2>&1 &
@@ -140,7 +141,7 @@ sleep 2
 
 # Start rank 0 (coordinator)
 log "Starting rank 0 on $NODE0..."
-ssh_cmd "$NODE0" "cd $REMOTE_DIR && \
+ssh_cmd "$NODE0" "env -C $REMOTE_DIR \
     RMLX_RANK=0 $COMMON_ENV \
     cargo bench -p rmlx-nn --bench $BENCH_NAME --features distributed 2>&1" \
     | tee "$RESULTS_DIR/${TIMESTAMP}_${BENCH_NAME}_tp2_rank0.txt" &

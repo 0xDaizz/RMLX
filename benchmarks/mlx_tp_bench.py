@@ -1,5 +1,9 @@
 #!/usr/bin/env python3
-"""MLX Tensor Parallel comparison benchmark.
+"""MLX Tensor Parallel comparison benchmark (production-optimized).
+
+Uses mx.fast.* fused kernels (rms_norm, rope, scaled_dot_product_attention)
+and mx.compile() to match real MLX inference performance. Includes KV cache
+to mirror RMLX's production decode path.
 
 Measures single-layer transformer forward pass latency at TP=1 and TP=2
 (simulated via half-sized weights), matching the RMLX distributed_bench
@@ -28,42 +32,19 @@ NUM_KV_HEADS = 8
 INTERMEDIATE_SIZE = 14336
 SEQ_LEN = 1  # decode token
 RMS_NORM_EPS = 1e-5
+KV_CACHE_LEN = 128  # pre-filled cache tokens
 
 WARMUP = 5
 ITERS = 50
 
 
 # ---------------------------------------------------------------------------
-# RMS Norm
-# ---------------------------------------------------------------------------
-def rms_norm(x, weight, eps=RMS_NORM_EPS):
-    """RMS normalization. x: [..., hidden], weight: [hidden]."""
-    rms = mx.rsqrt(mx.mean(x * x, axis=-1, keepdims=True) + eps)
-    return x * rms * weight
-
-
-# ---------------------------------------------------------------------------
-# RoPE
-# ---------------------------------------------------------------------------
-def apply_rope(x, offset, head_dim):
-    """Apply rotary position embeddings. x: [B, n_heads, seq, head_dim]."""
-    half = head_dim // 2
-    positions = mx.arange(offset, offset + x.shape[2])
-    freqs = 1.0 / (10000.0 ** (mx.arange(0, half).astype(mx.float32) / half))
-    theta = positions[:, None] * freqs[None, :]
-    cos_t = mx.cos(theta)[None, None, :, :]
-    sin_t = mx.sin(theta)[None, None, :, :]
-    x1 = x[..., :half]
-    x2 = x[..., half:]
-    return mx.concatenate([x1 * cos_t - x2 * sin_t, x2 * cos_t + x1 * sin_t], axis=-1)
-
-
-# ---------------------------------------------------------------------------
-# Single layer forward (configurable head/dim counts for TP)
+# Single layer forward (fused kernels, KV cache)
 # ---------------------------------------------------------------------------
 def layer_forward(x, w_q, w_k, w_v, w_o, w_gate, w_up, w_down, rms_w1, rms_w2,
-                  num_heads, num_kv_heads, head_dim, hidden_size):
-    """Single transformer decoder layer forward pass (decode mode, no KV cache).
+                  num_heads, num_kv_heads, head_dim, hidden_size,
+                  k_cache, v_cache, offset):
+    """Single transformer decoder layer forward pass (decode mode, with KV cache).
 
     Args:
         x:          [1, hidden_size]
@@ -76,57 +57,51 @@ def layer_forward(x, w_q, w_k, w_v, w_o, w_gate, w_up, w_down, rms_w1, rms_w2,
         w_down:     [intermediate, hidden_size]
         rms_w1:     [hidden_size]
         rms_w2:     [hidden_size]
+        k_cache:    [1, num_kv_heads, cache_len, head_dim]
+        v_cache:    [1, num_kv_heads, cache_len, head_dim]
+        offset:     int, position offset for RoPE
     """
     batch = x.shape[0]
 
-    # Pre-attention norm
-    h = rms_norm(x, rms_w1)
+    # Pre-attention norm (fused)
+    h = mx.fast.rms_norm(x, rms_w1, RMS_NORM_EPS)
 
     # QKV projections
-    q = h @ w_q  # [batch, num_heads * head_dim]
-    k = h @ w_k  # [batch, num_kv_heads * head_dim]
-    v = h @ w_v  # [batch, num_kv_heads * head_dim]
+    q = h @ w_q
+    k = h @ w_k
+    v = h @ w_v
 
-    # Reshape for attention
+    # Reshape
     q = q.reshape(batch, num_heads, 1, head_dim)
     k = k.reshape(batch, num_kv_heads, 1, head_dim)
     v = v.reshape(batch, num_kv_heads, 1, head_dim)
 
-    # RoPE
-    q = apply_rope(q, 0, head_dim)
-    k = apply_rope(k, 0, head_dim)
+    # RoPE (fused)
+    q = mx.fast.rope(q, head_dim, traditional=False, base=10000.0, scale=1.0, offset=offset)
+    k = mx.fast.rope(k, head_dim, traditional=False, base=10000.0, scale=1.0, offset=offset)
 
-    # GQA: repeat KV heads to match Q heads
-    if num_kv_heads < num_heads:
-        rep = num_heads // num_kv_heads
-        k = mx.repeat(k, rep, axis=1)
-        v = mx.repeat(v, rep, axis=1)
+    # KV cache update
+    k_cache_new = mx.concatenate([k_cache, k], axis=2)
+    v_cache_new = mx.concatenate([v_cache, v], axis=2)
 
-    # Attention (no cache, single token)
+    # SDPA (fused) - handles GQA internally
     scale = head_dim ** -0.5
-    scores = (q @ k.transpose(0, 1, 3, 2)) * scale  # [batch, heads, 1, 1]
-    attn = mx.softmax(scores, axis=-1)
-    attn_out = (attn @ v).reshape(batch, num_heads * head_dim)  # [batch, q_dim]
+    attn_out = mx.fast.scaled_dot_product_attention(q, k_cache_new, v_cache_new, scale=scale)
+    attn_out = attn_out.reshape(batch, num_heads * head_dim)
 
-    # Output projection
-    o = attn_out @ w_o  # [batch, hidden_size]
+    # O projection + residual
+    x = x + attn_out @ w_o
 
-    # Residual
-    x = x + o
-
-    # Pre-FFN norm
-    h2 = rms_norm(x, rms_w2)
+    # Pre-FFN norm (fused)
+    h2 = mx.fast.rms_norm(x, rms_w2, RMS_NORM_EPS)
 
     # SwiGLU FFN
     gate = h2 @ w_gate
     up = h2 @ w_up
-    hidden = mx.sigmoid(gate) * gate * up  # SiLU(gate) * up
-    down = hidden @ w_down  # [batch, hidden_size]
+    hidden = mx.sigmoid(gate) * gate * up
+    x = x + hidden @ w_down
 
-    # Residual
-    x = x + down
-
-    return x
+    return x, k_cache_new, v_cache_new
 
 
 # ---------------------------------------------------------------------------
@@ -155,13 +130,18 @@ def build_weights(hidden_size, num_heads, num_kv_heads, head_dim, intermediate, 
     rms_w1 = mx.ones((hidden_size,), dtype=mx.float16)
     rms_w2 = mx.ones((hidden_size,), dtype=mx.float16)
 
+    # Pre-fill KV cache
+    k_cache = mx.zeros((1, nkv, KV_CACHE_LEN, head_dim), dtype=mx.float16)
+    v_cache = mx.zeros((1, nkv, KV_CACHE_LEN, head_dim), dtype=mx.float16)
+
     # Evaluate to materialize
-    mx.eval(w_q, w_k, w_v, w_o, w_gate, w_up, w_down, rms_w1, rms_w2)
+    mx.eval(w_q, w_k, w_v, w_o, w_gate, w_up, w_down, rms_w1, rms_w2, k_cache, v_cache)
 
     return {
         "w_q": w_q, "w_k": w_k, "w_v": w_v, "w_o": w_o,
         "w_gate": w_gate, "w_up": w_up, "w_down": w_down,
         "rms_w1": rms_w1, "rms_w2": rms_w2,
+        "k_cache": k_cache, "v_cache": v_cache,
         "num_heads": nh, "num_kv_heads": nkv,
     }
 
@@ -169,34 +149,36 @@ def build_weights(hidden_size, num_heads, num_kv_heads, head_dim, intermediate, 
 # ---------------------------------------------------------------------------
 # Benchmark runner
 # ---------------------------------------------------------------------------
-def bench_layer(label, weights, hidden_size, head_dim, warmup, iters):
+def bench_layer(label, weights, hidden_size, head_dim, warmup, iters, use_compile=False):
     """Benchmark a single layer forward pass."""
     x = (mx.random.normal((SEQ_LEN, hidden_size)) * 0.02).astype(mx.float16)
     mx.eval(x)
 
     nh = weights["num_heads"]
     nkv = weights["num_kv_heads"]
+    offset = KV_CACHE_LEN  # position after pre-filled cache
 
-    # Warmup
-    for _ in range(warmup):
-        out = layer_forward(
+    forward_fn = mx.compile(layer_forward) if use_compile else layer_forward
+
+    def run_once():
+        return forward_fn(
             x, weights["w_q"], weights["w_k"], weights["w_v"], weights["w_o"],
             weights["w_gate"], weights["w_up"], weights["w_down"],
             weights["rms_w1"], weights["rms_w2"],
             nh, nkv, head_dim, hidden_size,
+            weights["k_cache"], weights["v_cache"], offset,
         )
+
+    # Warmup
+    for _ in range(warmup):
+        out, _, _ = run_once()
         mx.eval(out)
 
     # Benchmark
     latencies = []
     for _ in range(iters):
         t0 = time.perf_counter()
-        out = layer_forward(
-            x, weights["w_q"], weights["w_k"], weights["w_v"], weights["w_o"],
-            weights["w_gate"], weights["w_up"], weights["w_down"],
-            weights["rms_w1"], weights["rms_w2"],
-            nh, nkv, head_dim, hidden_size,
-        )
+        out, _, _ = run_once()
         mx.eval(out)
         t1 = time.perf_counter()
         latencies.append((t1 - t0) * 1e6)  # us
@@ -213,23 +195,29 @@ def bench_layer(label, weights, hidden_size, head_dim, warmup, iters):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="MLX TP comparison benchmark")
+    parser = argparse.ArgumentParser(description="MLX TP comparison benchmark (production-optimized)")
     parser.add_argument("--warmup", type=int, default=WARMUP)
     parser.add_argument("--iters", type=int, default=ITERS)
     args = parser.parse_args()
 
-    print(f"MLX TP Benchmark")
+    print(f"MLX TP Benchmark (production-optimized)")
     print(f"  Config: Mixtral-like, hidden={HIDDEN_SIZE}, heads={NUM_HEADS}/{NUM_KV_HEADS}, "
           f"head_dim={HEAD_DIM}, intermediate={INTERMEDIATE_SIZE}")
-    print(f"  seq_len={SEQ_LEN} (decode), dtype=float16")
+    print(f"  seq_len={SEQ_LEN} (decode), dtype=float16, kv_cache={KV_CACHE_LEN} tokens")
+    print(f"  Fused: mx.fast.rms_norm, mx.fast.rope, mx.fast.scaled_dot_product_attention")
     print(f"  warmup={args.warmup}, iters={args.iters}")
 
     # ── TP=1 (full weights, no parallelism) ──
     print(f"\n=== TP=1: Full weights (baseline) ===")
     w_tp1 = build_weights(HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_SIZE, tp_size=1)
+
     tp1_mean = bench_layer(
-        "TP=1 single-layer forward",
-        w_tp1, HIDDEN_SIZE, HEAD_DIM, args.warmup, args.iters,
+        "TP=1 single-layer (uncompiled)",
+        w_tp1, HIDDEN_SIZE, HEAD_DIM, args.warmup, args.iters, use_compile=False,
+    )
+    tp1_compiled = bench_layer(
+        "TP=1 single-layer (mx.compile)",
+        w_tp1, HIDDEN_SIZE, HEAD_DIM, args.warmup, args.iters, use_compile=True,
     )
 
     # ── TP=2 (half-sized weights, simulating one rank) ──
@@ -237,29 +225,45 @@ def main():
     print(f"  Q/K/V/gate/up: column-parallel (output halved)")
     print(f"  O/down: row-parallel (input halved)")
     w_tp2 = build_weights(HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_SIZE, tp_size=2)
+
     tp2_mean = bench_layer(
-        "TP=2 single-layer forward (half weights)",
-        w_tp2, HIDDEN_SIZE, HEAD_DIM, args.warmup, args.iters,
+        "TP=2 single-layer (uncompiled)",
+        w_tp2, HIDDEN_SIZE, HEAD_DIM, args.warmup, args.iters, use_compile=False,
+    )
+    tp2_compiled = bench_layer(
+        "TP=2 single-layer (mx.compile)",
+        w_tp2, HIDDEN_SIZE, HEAD_DIM, args.warmup, args.iters, use_compile=True,
     )
 
     # ── Summary ──
     print(f"\n{'='*72}")
     print(f"SUMMARY")
     print(f"{'='*72}")
-    print(f"  {'TP=1 baseline':<44s} {tp1_mean:>8.1f} us")
-    print(f"  {'TP=2 half-weight compute':<44s} {tp2_mean:>8.1f} us")
+    print(f"  {'TP=1 baseline (uncompiled)':<44s} {tp1_mean:>8.1f} us")
+    print(f"  {'TP=1 baseline (mx.compile)':<44s} {tp1_compiled:>8.1f} us")
+    print(f"  {'TP=2 half-weight (uncompiled)':<44s} {tp2_mean:>8.1f} us")
+    print(f"  {'TP=2 half-weight (mx.compile)':<44s} {tp2_compiled:>8.1f} us")
 
-    saving = tp1_mean - tp2_mean
-    pct = saving / tp1_mean * 100 if tp1_mean > 0 else 0
-    print(f"  {'Compute saving from TP=2':<44s} {saving:>8.1f} us ({pct:.1f}%)")
+    # Use compiled results for the main comparison
+    tp1_best = min(tp1_mean, tp1_compiled)
+    tp2_best = min(tp2_mean, tp2_compiled)
+
+    saving = tp1_best - tp2_best
+    pct = saving / tp1_best * 100 if tp1_best > 0 else 0
+    print(f"\n  {'Compute saving (best of each)':<44s} {saving:>8.1f} us ({pct:.1f}%)")
+
+    compile_speedup_tp1 = tp1_mean / tp1_compiled if tp1_compiled > 0 else 0
+    compile_speedup_tp2 = tp2_mean / tp2_compiled if tp2_compiled > 0 else 0
+    print(f"  {'mx.compile speedup (TP=1)':<44s} {compile_speedup_tp1:>8.2f}x")
+    print(f"  {'mx.compile speedup (TP=2)':<44s} {compile_speedup_tp2:>8.2f}x")
 
     # Estimate real TP layer time with RDMA allreduce
-    rdma_allreduce_us = 10.0  # conservative per-call estimate for TB5
-    tp2_real = tp2_mean + 2 * rdma_allreduce_us
+    rdma_allreduce_us = 15.8  # measured per-call latency for TB5
+    tp2_real = tp2_best + 2 * rdma_allreduce_us
     print()
-    print(f"  Estimated real TP=2 with 2x RDMA allreduce:")
+    print(f"  Estimated real TP=2 with 2x RDMA allreduce ({rdma_allreduce_us} us/call):")
     print(f"  {'  sharded compute + 2x RDMA':<44s} {tp2_real:>8.1f} us")
-    speedup = tp1_mean / tp2_real if tp2_real > 0 else 0
+    speedup = tp1_best / tp2_real if tp2_real > 0 else 0
     print(f"  {'  Estimated speedup vs baseline':<44s} {speedup:>8.2f}x")
     print()
 

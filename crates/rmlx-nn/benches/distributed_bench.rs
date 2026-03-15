@@ -7,7 +7,8 @@
 //! Measures single-layer transformer forward pass with and without TP overhead,
 //! using Mixtral 8x7B-like config (hidden=4096, intermediate=14336, 32 heads, 8 KV heads).
 //!
-//! All benchmarks use **f16** dtype (realistic inference precision) and include:
+//! All benchmarks use **f16** dtype (realistic inference precision) with RoPE and
+//! a KV cache pre-filled with 128 tokens (matching MLX benchmark workload). Includes:
 //! 1. **Baseline sync forward**: `forward()` — per-op dispatch (slow, for reference only)
 //! 2. **Optimized single-CB forward**: `forward_decode_into_cb()` — all ops in one command buffer
 //! 3. **TP-sharded compute**: half-size weights (no communication)
@@ -34,7 +35,9 @@ use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use rmlx_nn::{Attention, AttentionConfig, FeedForward, Linear, LinearConfig, TransformerBlock};
+use rmlx_nn::{
+    Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
+};
 
 // ─── Mixtral 8x7B-like config (dense attention + gated FFN per expert) ───
 const HIDDEN_SIZE: usize = 4096;
@@ -44,6 +47,9 @@ const HEAD_DIM: usize = 128;
 const INTERMEDIATE_DIM: usize = 14336;
 const SEQ_LEN: usize = 1; // decode token
 const RMS_NORM_EPS: f32 = 1e-5;
+const ROPE_THETA: f32 = 10000.0;
+const MAX_SEQ_LEN: usize = 2048;
+const KV_CACHE_LEN: usize = 128; // pre-filled KV cache length (matches MLX benchmark)
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 50;
@@ -164,6 +170,35 @@ fn rand_array_ones(device: &ProtocolObject<dyn objc2_metal::MTLDevice>, shape: &
         f16_bytes.extend_from_slice(&one_f16.to_le_bytes());
     }
     Array::from_bytes(device, &f16_bytes, shape.to_vec(), DType::Float16)
+}
+
+// ---------------------------------------------------------------------------
+// RoPE + KV cache helpers
+// ---------------------------------------------------------------------------
+
+/// Precompute RoPE cos/sin frequency tables: shape [MAX_SEQ_LEN, HEAD_DIM/2].
+fn precompute_rope(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> (Array, Array) {
+    let (cos_vec, sin_vec) = ops::rope::precompute_freqs(MAX_SEQ_LEN, HEAD_DIM, ROPE_THETA, 1.0)
+        .expect("precompute_freqs failed");
+    let cos_freqs = Array::from_slice(device, &cos_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
+    let sin_freqs = Array::from_slice(device, &sin_vec, vec![MAX_SEQ_LEN, HEAD_DIM / 2]);
+    (cos_freqs, sin_freqs)
+}
+
+/// Create a pre-allocated KV cache with `KV_CACHE_LEN` tokens already "filled".
+///
+/// The cache buffers are pre-allocated and `seq_len` is set to `KV_CACHE_LEN`
+/// to simulate a decode step after 128 tokens of prefill (matching MLX benchmark).
+/// The actual buffer contents don't matter for benchmarking compute cost —
+/// what matters is the SDPA sees the correct sequence length.
+fn make_prefilled_cache(
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    num_kv_heads: usize,
+) -> LayerKvCache {
+    let mut cache =
+        LayerKvCache::preallocated(device, num_kv_heads, HEAD_DIM, MAX_SEQ_LEN, DType::Float16);
+    cache.seq_len = KV_CACHE_LEN;
+    cache
 }
 
 // ---------------------------------------------------------------------------
@@ -316,13 +351,30 @@ where
 fn bench_baseline_sync(
     block: &TransformerBlock,
     input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    cache: &mut LayerKvCache,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Stats {
     println!("\n=== Baseline sync: single-layer forward() — per-op dispatch (slow) ===");
+    println!(
+        "  RoPE: enabled (head_dim={}, theta={})",
+        HEAD_DIM, ROPE_THETA
+    );
+    println!("  KV cache: {} tokens pre-filled", KV_CACHE_LEN);
     run_bench("baseline_sync_forward", || {
+        cache.seq_len = KV_CACHE_LEN; // reset to pre-filled state
         let _ = block
-            .forward(input, None, None, None, None, registry, queue)
+            .forward(
+                input,
+                Some(cos_freqs),
+                Some(sin_freqs),
+                None,
+                Some(cache),
+                registry,
+                queue,
+            )
             .expect("baseline forward");
     })
 }
@@ -330,14 +382,30 @@ fn bench_baseline_sync(
 fn bench_optimized_single_cb(
     block: &TransformerBlock,
     input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    cache: &mut LayerKvCache,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Stats {
     println!("\n=== Optimized: forward_decode_into_cb() — all ops in one command buffer ===");
+    println!(
+        "  RoPE: enabled, KV cache: {} tokens pre-filled",
+        KV_CACHE_LEN
+    );
     run_bench("optimized_single_cb", || {
+        cache.seq_len = KV_CACHE_LEN; // reset to pre-filled state
         let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_decode_into_cb(input, None, None, None, None, registry, &cb)
+            .forward_decode_into_cb(
+                input,
+                Some(cos_freqs),
+                Some(sin_freqs),
+                None,
+                Some(cache),
+                registry,
+                &cb,
+            )
             .expect("single_cb forward");
         cb.commit();
         cb.waitUntilCompleted();
@@ -351,15 +419,31 @@ fn bench_optimized_single_cb(
 fn bench_sharded_compute(
     block: &TransformerBlock,
     input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    cache: &mut LayerKvCache,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
 ) -> Stats {
     println!("\n=== TP-sharded compute (half-size weights, single-CB, no allreduce) ===");
     println!("  Simulates rank 0 of TP=2: Q/K/V/gate/up halved, O/down halved.");
+    println!(
+        "  RoPE: enabled, KV cache: {} tokens pre-filled",
+        KV_CACHE_LEN
+    );
     run_bench("sharded_single_cb (TP=2 rank0)", || {
+        cache.seq_len = KV_CACHE_LEN; // reset to pre-filled state
         let cb = queue.commandBufferWithUnretainedReferences().unwrap();
         let _ = block
-            .forward_decode_into_cb(input, None, None, None, None, registry, &cb)
+            .forward_decode_into_cb(
+                input,
+                Some(cos_freqs),
+                Some(sin_freqs),
+                None,
+                Some(cache),
+                registry,
+                &cb,
+            )
             .expect("sharded forward");
         cb.commit();
         cb.waitUntilCompleted();
@@ -532,6 +616,12 @@ fn bench_allreduce(
             single_stats.mean
         );
 
+        // Barrier: synchronize ranks before switching to large payload
+        // to prevent UC silent-drop (recv not posted when send arrives)
+        dist.group
+            .barrier()
+            .expect("barrier before large-payload allreduce");
+
         // Also measure with larger payload
         let large_output = rand_array(device, &[SEQ_LEN, INTERMEDIATE_DIM], 201);
         let large_bytes = SEQ_LEN * INTERMEDIATE_DIM * 2;
@@ -654,6 +744,9 @@ fn bench_parallel_linear(
 fn bench_tp_forward_with_group(
     block: &TransformerBlock,
     input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    cache: &mut LayerKvCache,
     device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
@@ -664,21 +757,70 @@ fn bench_tp_forward_with_group(
         dist.rank, dist.world_size
     );
     println!("  Full layer forward: compute (half weights) + 2x real allreduce");
+    println!(
+        "  RoPE: enabled, KV cache: {} tokens pre-filled",
+        KV_CACHE_LEN
+    );
 
     run_bench("tp_forward_with_group (RDMA)", || {
+        cache.seq_len = KV_CACHE_LEN; // reset to pre-filled state
         let _ = block
             .forward_with_group(
                 input,
+                Some(cos_freqs),
+                Some(sin_freqs),
                 None,
-                None,
-                None,
-                None,
+                Some(cache),
                 &dist.group,
                 device,
                 registry,
                 queue,
             )
             .expect("tp forward_with_group");
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: TP forward_with_group_split_cb (Split-CB, multi-rank only)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "distributed")]
+fn bench_tp_forward_split_cb(
+    block: &TransformerBlock,
+    input: &Array,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    cache: &mut LayerKvCache,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    registry: &KernelRegistry,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    dist: &BenchDistCtx,
+) -> Stats {
+    println!(
+        "\n=== TP forward_with_group_split_cb (Split-CB, rank={}, world_size={}) ===",
+        dist.rank, dist.world_size
+    );
+    println!("  Split-CB: 2 CBs per layer + 2 allreduce syncs");
+    println!(
+        "  RoPE: enabled, KV cache: {} tokens pre-filled",
+        KV_CACHE_LEN
+    );
+
+    run_bench("tp_forward_split_cb (RDMA)", || {
+        cache.seq_len = KV_CACHE_LEN; // reset to pre-filled state
+        let _ = block
+            .forward_with_group_split_cb(
+                input,
+                Some(cos_freqs),
+                Some(sin_freqs),
+                None,
+                Some(cache),
+                &dist.group,
+                device,
+                registry,
+                queue,
+            )
+            .expect("split-cb forward");
     })
 }
 
@@ -712,22 +854,64 @@ fn main() {
         "  dtype: float16, warmup={}, bench_iters={}",
         WARMUP_ITERS, BENCH_ITERS
     );
+    println!(
+        "  rope: theta={}, kv_cache: {} tokens pre-filled",
+        ROPE_THETA, KV_CACHE_LEN
+    );
+
+    // ── Precompute RoPE cos/sin frequency tables ──
+    let (cos_freqs, sin_freqs) = precompute_rope(device);
 
     // ── 1. Baseline sync: full-size single-layer forward (per-op dispatch) ──
-    let block = build_transformer_block(device);
+    let mut block = build_transformer_block(device);
+    block
+        .prepare_weights_for_graph(&registry, &queue)
+        .expect("prepare_weights_for_graph (full)");
+    println!("  [merged gate-up weights + pre-transposed weights enabled]");
     let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
-    let baseline_stats = bench_baseline_sync(&block, &input, &registry, &queue);
+    let mut cache_full = make_prefilled_cache(device, NUM_KV_HEADS);
+    let baseline_stats = bench_baseline_sync(
+        &block,
+        &input,
+        &cos_freqs,
+        &sin_freqs,
+        &mut cache_full,
+        &registry,
+        &queue,
+    );
 
     // ── 2. Optimized: forward_decode_into_cb (all ops in one CB) ──
-    let optimized_stats = bench_optimized_single_cb(&block, &input, &registry, &queue);
+    let optimized_stats = bench_optimized_single_cb(
+        &block,
+        &input,
+        &cos_freqs,
+        &sin_freqs,
+        &mut cache_full,
+        &registry,
+        &queue,
+    );
 
     // ── 3. TP-sharded compute (half-size weights, single-CB) ──
     #[cfg(feature = "distributed")]
     let rank_for_shard = dist.rank;
     #[cfg(not(feature = "distributed"))]
     let rank_for_shard = 0u32;
-    let sharded_block = build_sharded_transformer_block(device, rank_for_shard);
-    let sharded_stats = bench_sharded_compute(&sharded_block, &input, &registry, &queue);
+    let mut sharded_block = build_sharded_transformer_block(device, rank_for_shard);
+    sharded_block
+        .prepare_weights_for_graph(&registry, &queue)
+        .expect("prepare_weights_for_graph (sharded)");
+    println!("  [merged gate-up weights + pre-transposed weights enabled (sharded)]");
+    // Sharded block has half the KV heads (TP=2)
+    let mut cache_sharded = make_prefilled_cache(device, NUM_KV_HEADS / 2);
+    let sharded_stats = bench_sharded_compute(
+        &sharded_block,
+        &input,
+        &cos_freqs,
+        &sin_freqs,
+        &mut cache_sharded,
+        &registry,
+        &queue,
+    );
 
     // ── 4. Weight sharding overhead ──
     let shard_stats = bench_weight_sharding(device);
@@ -746,6 +930,27 @@ fn main() {
         Some(bench_tp_forward_with_group(
             &sharded_block,
             &input,
+            &cos_freqs,
+            &sin_freqs,
+            &mut cache_sharded,
+            device,
+            &registry,
+            &queue,
+            &dist,
+        ))
+    } else {
+        None
+    };
+
+    // ── 8. TP forward_with_group_split_cb (Split-CB, multi-rank only) ──
+    #[cfg(feature = "distributed")]
+    let tp_split_cb_stats = if dist.is_multi_rank {
+        Some(bench_tp_forward_split_cb(
+            &sharded_block,
+            &input,
+            &cos_freqs,
+            &sin_freqs,
+            &mut cache_sharded,
             device,
             &registry,
             &queue,
@@ -836,6 +1041,32 @@ fn main() {
                 "  {:44} {:>8.1} us ({:.1}%)",
                 "  Communication overhead", comm_overhead, comm_pct
             );
+
+            // Split-CB results
+            if let Some(ref split_cb_stats) = tp_split_cb_stats {
+                println!(
+                    "  {:44} {:>8.1} us",
+                    "  TP forward_split_cb (Split-CB, RDMA)", split_cb_stats.mean
+                );
+                let split_cb_speedup = if split_cb_stats.mean > 0.0 {
+                    optimized_stats.mean / split_cb_stats.mean
+                } else {
+                    0.0
+                };
+                println!(
+                    "  {:44} {:>8.2}x",
+                    "  Split-CB TP=2 speedup vs single-CB", split_cb_speedup
+                );
+                let split_vs_single = if tp_stats.mean > 0.0 {
+                    (tp_stats.mean - split_cb_stats.mean) / tp_stats.mean * 100.0
+                } else {
+                    0.0
+                };
+                println!(
+                    "  {:44} {:>8.1}%",
+                    "  Split-CB vs single-CB TP improvement", split_vs_single
+                );
+            }
         } else {
             // Estimate real TP layer time
             let estimated_rdma_allreduce_us = 10.0;
