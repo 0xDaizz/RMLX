@@ -1336,7 +1336,7 @@ impl RdmaConnection {
 
                 self.qp.post_send(&mut wr)?;
                 in_flight += 1;
-                send_offset += chunk_size;
+                send_offset += chunk;
                 buf_idx += 1;
             }
         }
@@ -1389,7 +1389,7 @@ impl RdmaConnection {
 
                         self.qp.post_send(&mut wr)?;
                         in_flight += 1;
-                        send_offset += chunk_size;
+                        send_offset += chunk;
                     }
                 } else if work_type == RECV_WR {
                     // Recv completed — copy data out and post next recv if needed
@@ -1398,7 +1398,7 @@ impl RdmaConnection {
                         let rbuf = &pool.recv[tier][buf_idx];
                         let src = rbuf.read(chunk);
                         recv_result[recv_offset..recv_offset + chunk].copy_from_slice(&src);
-                        recv_offset += chunk_size;
+                        recv_offset += chunk;
                     }
                     // Post next recv if more data expected
                     let remaining_recvs = if recv_total > recv_offset {

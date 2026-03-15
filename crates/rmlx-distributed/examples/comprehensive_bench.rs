@@ -18,7 +18,11 @@ use std::collections::BTreeMap;
 use std::io::Write;
 use std::time::Instant;
 
-use rmlx_distributed::{init, Group, InitConfig, ReduceDtype, ReduceOp};
+use std::sync::Arc;
+
+use rmlx_distributed::group::{Group, ReduceDtype, ReduceOp};
+use rmlx_distributed::transport::RdmaConnectionTransport;
+use rmlx_rdma::connection::{RdmaConfig, RdmaConnection};
 
 // ── Constants ──
 
@@ -97,18 +101,31 @@ fn bench_send_recv(group: &Group) -> Vec<serde_json::Value> {
         eprintln!("  send_recv: size={size}");
         let data = vec![0xABu8; size];
 
-        // Warmup — bidirectional: both ranks send AND recv simultaneously
+        // Warmup — bidirectional: rank 0 sends then recvs, rank 1 recvs then sends
+        // (avoids chunked_sendrecv bug on 1MB+ payloads)
         for _ in 0..WARMUP_ITERS {
             group.barrier().unwrap();
-            let _ = group.sendrecv(&data, peer, size, peer).unwrap();
+            if rank == 0 {
+                group.send(&data, peer).unwrap();
+                let _ = group.recv(peer, size).unwrap();
+            } else {
+                let _ = group.recv(peer, size).unwrap();
+                group.send(&data, peer).unwrap();
+            }
         }
 
-        // Timed — bidirectional sendrecv
+        // Timed — bidirectional send+recv
         let mut times = Vec::with_capacity(TIMED_ITERS);
         for _ in 0..TIMED_ITERS {
             group.barrier().unwrap();
             let start = Instant::now();
-            let _ = group.sendrecv(&data, peer, size, peer).unwrap();
+            if rank == 0 {
+                group.send(&data, peer).unwrap();
+                let _ = group.recv(peer, size).unwrap();
+            } else {
+                let _ = group.recv(peer, size).unwrap();
+                group.send(&data, peer).unwrap();
+            }
             times.push(start.elapsed().as_secs_f64() * 1e3);
         }
 
@@ -378,28 +395,46 @@ fn lcm(a: usize, b: usize) -> usize {
 fn main() {
     eprintln!("[bench] Starting RMLX comprehensive RDMA benchmark...");
 
-    let config = InitConfig::default();
-    let ctx = match init(config) {
-        Ok(ctx) => {
-            eprintln!(
-                "[bench] init OK: rank={}, world_size={}, transport={}",
-                ctx.rank,
-                ctx.world_size,
-                if ctx.group.has_transport() {
-                    "rdma"
-                } else {
-                    "loopback"
-                }
-            );
-            ctx
-        }
-        Err(e) => {
-            eprintln!("[bench] init FAILED: {e}");
-            std::process::exit(1);
-        }
+    // Use RdmaConnection::establish() directly (same pattern as 2-node tests)
+    let rank: u32 = std::env::var("RMLX_RANK")
+        .expect("RMLX_RANK required")
+        .parse()
+        .expect("invalid RMLX_RANK");
+    let peer_host = std::env::var("RMLX_PEER_HOST").unwrap_or_else(|_| "10.254.0.5".into());
+    let port: u16 = std::env::var("RMLX_TEST_PORT")
+        .unwrap_or_else(|_| "18515".into())
+        .parse()
+        .unwrap();
+
+    let config = RdmaConfig {
+        rank,
+        world_size: 2,
+        peer_host,
+        exchange_port: port,
+        sync_port: port + 1,
+        accept_timeout_secs: 10,
+        connect_timeout_ms: 5000,
+        ..Default::default()
     };
 
-    let group = &ctx.group;
+    eprintln!("[bench] Establishing RDMA connection (rank={rank})...");
+    let conn = RdmaConnection::establish(config).unwrap_or_else(|e| {
+        eprintln!("[bench] establish FAILED: {e}");
+        std::process::exit(1);
+    });
+    eprintln!("[bench] Connection established");
+
+    let peer_rank = 1 - rank;
+    let mut connections: Vec<Option<RdmaConnection>> = vec![None, None];
+    connections[peer_rank as usize] = Some(conn);
+    let transport = Arc::new(RdmaConnectionTransport::new(connections, rank));
+    let group_owned = Group::with_transport(vec![0, 1], rank, 2, transport).unwrap_or_else(|e| {
+        eprintln!("[bench] Group creation FAILED: {e}");
+        std::process::exit(1);
+    });
+    eprintln!("[bench] init OK: rank={rank}, world_size=2, transport=rdma");
+
+    let group = &group_owned;
     let mut results: BTreeMap<String, serde_json::Value> = BTreeMap::new();
 
     // 1. Send/Recv
@@ -461,8 +496,8 @@ fn main() {
     let output = serde_json::json!({
         "framework": "RMLX",
         "timestamp": chrono_timestamp(),
-        "node_count": ctx.world_size,
-        "rank": ctx.rank,
+        "node_count": 2,
+        "rank": rank,
         "warmup": WARMUP_ITERS,
         "iters": TIMED_ITERS,
         "results": results
