@@ -7,7 +7,7 @@ to mirror RMLX's production decode path.
 
 Measures single-layer transformer forward pass latency at TP=1 and TP=2
 (simulated via half-sized weights), matching the RMLX distributed_bench
-configuration (Mixtral: hidden=4096, intermediate=14336, 32 heads, 8 KV heads).
+configuration (Qwen 3.5 MoE A22B: hidden=3584, intermediate=18944, 28 heads, 4 KV heads).
 
 For TP=2 simulation: weights are halved on the output/input dimension
 (ColumnParallel/RowParallel), identical to RMLX's approach.
@@ -23,15 +23,15 @@ import statistics
 import mlx.core as mx
 
 # ---------------------------------------------------------------------------
-# Mixtral 8x7B-like config (matches RMLX distributed_bench)
+# Qwen 3.5 MoE A22B config (matches RMLX distributed_bench)
 # ---------------------------------------------------------------------------
-HIDDEN_SIZE = 4096
-NUM_HEADS = 32
+HIDDEN_SIZE = 3584
+NUM_HEADS = 28
 HEAD_DIM = 128
-NUM_KV_HEADS = 8
-INTERMEDIATE_SIZE = 14336
+NUM_KV_HEADS = 4
+INTERMEDIATE_SIZE = 18944
 SEQ_LEN = 1  # decode token
-RMS_NORM_EPS = 1e-5
+RMS_NORM_EPS = 1e-6
 KV_CACHE_LEN = 128  # pre-filled cache tokens
 
 WARMUP = 5
@@ -61,7 +61,7 @@ def layer_forward(x, w_q, w_k, w_v, w_o, w_gate, w_up, w_down, rms_w1, rms_w2,
         v_cache:    [1, num_kv_heads, cache_len, head_dim]
         offset:     int, position offset for RoPE
     """
-    batch = x.shape[0]
+    seq_len = x.shape[0]  # tokens in this forward call (1 for decode, N for prefill)
 
     # Pre-attention norm (fused)
     h = mx.fast.rms_norm(x, rms_w1, RMS_NORM_EPS)
@@ -71,14 +71,14 @@ def layer_forward(x, w_q, w_k, w_v, w_o, w_gate, w_up, w_down, rms_w1, rms_w2,
     k = h @ w_k
     v = h @ w_v
 
-    # Reshape
-    q = q.reshape(batch, num_heads, 1, head_dim)
-    k = k.reshape(batch, num_kv_heads, 1, head_dim)
-    v = v.reshape(batch, num_kv_heads, 1, head_dim)
+    # Reshape: [batch=1, heads, seq_len, head_dim]
+    q = q.reshape(1, num_heads, seq_len, head_dim)
+    k = k.reshape(1, num_kv_heads, seq_len, head_dim)
+    v = v.reshape(1, num_kv_heads, seq_len, head_dim)
 
     # RoPE (fused)
-    q = mx.fast.rope(q, head_dim, traditional=False, base=10000.0, scale=1.0, offset=offset)
-    k = mx.fast.rope(k, head_dim, traditional=False, base=10000.0, scale=1.0, offset=offset)
+    q = mx.fast.rope(q, head_dim, traditional=False, base=1000000.0, scale=1.0, offset=offset)
+    k = mx.fast.rope(k, head_dim, traditional=False, base=1000000.0, scale=1.0, offset=offset)
 
     # KV cache update
     k_cache_new = mx.concatenate([k_cache, k], axis=2)
@@ -87,7 +87,7 @@ def layer_forward(x, w_q, w_k, w_v, w_o, w_gate, w_up, w_down, rms_w1, rms_w2,
     # SDPA (fused) - handles GQA internally
     scale = head_dim ** -0.5
     attn_out = mx.fast.scaled_dot_product_attention(q, k_cache_new, v_cache_new, scale=scale)
-    attn_out = attn_out.reshape(batch, num_heads * head_dim)
+    attn_out = attn_out.reshape(seq_len, num_heads * head_dim)
 
     # O projection + residual
     x = x + attn_out @ w_o
@@ -201,7 +201,7 @@ def main():
     args = parser.parse_args()
 
     print(f"MLX TP Benchmark (production-optimized)")
-    print(f"  Config: Mixtral-like, hidden={HIDDEN_SIZE}, heads={NUM_HEADS}/{NUM_KV_HEADS}, "
+    print(f"  Config: Qwen 3.5 MoE A22B, hidden={HIDDEN_SIZE}, heads={NUM_HEADS}/{NUM_KV_HEADS}, "
           f"head_dim={HEAD_DIM}, intermediate={INTERMEDIATE_SIZE}")
     print(f"  seq_len={SEQ_LEN} (decode), dtype=float16, kv_cache={KV_CACHE_LEN} tokens")
     print(f"  Fused: mx.fast.rms_norm, mx.fast.rope, mx.fast.scaled_dot_product_attention")

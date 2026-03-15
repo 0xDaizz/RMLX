@@ -5,7 +5,7 @@
 //! Distributed Tensor Parallel Benchmark (Phase I-1 / J-7)
 //!
 //! Measures single-layer transformer forward pass with and without TP overhead,
-//! using Mixtral 8x7B-like config (hidden=4096, intermediate=14336, 32 heads, 8 KV heads).
+//! using Qwen 3.5 MoE A22B config (hidden=3584, intermediate=18944, 28 heads, 4 KV heads).
 //!
 //! All benchmarks use **f16** dtype (realistic inference precision) with RoPE and
 //! a KV cache pre-filled with 128 tokens (matching MLX benchmark workload). Includes:
@@ -39,15 +39,15 @@ use rmlx_nn::{
     Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
 };
 
-// ─── Mixtral 8x7B-like config (dense attention + gated FFN per expert) ───
-const HIDDEN_SIZE: usize = 4096;
-const NUM_HEADS: usize = 32;
-const NUM_KV_HEADS: usize = 8;
+// ─── Qwen 3.5 MoE A22B config (dense attention + gated FFN per expert) ───
+const HIDDEN_SIZE: usize = 3584;
+const NUM_HEADS: usize = 28;
+const NUM_KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 128;
-const INTERMEDIATE_DIM: usize = 14336;
+const INTERMEDIATE_DIM: usize = 18944;
 const SEQ_LEN: usize = 1; // decode token
-const RMS_NORM_EPS: f32 = 1e-5;
-const ROPE_THETA: f32 = 10000.0;
+const RMS_NORM_EPS: f32 = 1e-6;
+const ROPE_THETA: f32 = 1000000.0;
 const MAX_SEQ_LEN: usize = 2048;
 const KV_CACHE_LEN: usize = 128; // pre-filled KV cache length (matches MLX benchmark)
 
@@ -240,7 +240,7 @@ fn build_transformer_block(
         num_kv_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
         max_seq_len: 2048,
-        rope_theta: 10000.0,
+        rope_theta: 1000000.0,
     };
     let attention =
         Attention::from_layers(attn_config, q_proj, k_proj, v_proj, o_proj).expect("attention");
@@ -291,7 +291,7 @@ fn build_sharded_transformer_block(
         num_kv_heads: NUM_KV_HEADS / 2,
         head_dim: HEAD_DIM,
         max_seq_len: 2048,
-        rope_theta: 10000.0,
+        rope_theta: 1000000.0,
     };
     let attention =
         Attention::from_layers(attn_config, q_proj, k_proj, v_proj, o_proj).expect("attention");
@@ -457,7 +457,7 @@ fn bench_sharded_compute(
 fn bench_weight_sharding(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> Stats {
     use rmlx_nn::{ColumnParallelLinear, RowParallelLinear};
 
-    println!("\n=== Weight sharding overhead (Mixtral-like, TP=2) ===");
+    println!("\n=== Weight sharding overhead (Qwen 3.5 MoE A22B, TP=2) ===");
 
     let q_weight = rand_array(device, &[HIDDEN_SIZE, HIDDEN_SIZE], 100);
     let k_weight = rand_array(device, &[NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE], 101);
@@ -671,7 +671,7 @@ fn bench_parallel_linear(
 
         let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
 
-        let col_stats = run_bench("ColumnParallel [4096->7168] (RDMA)", || {
+        let col_stats = run_bench("ColumnParallel [3584->9472] (RDMA)", || {
             let _ = col_layer
                 .forward_with_group(&input, &dist.group, registry, queue)
                 .expect("col forward");
@@ -693,7 +693,7 @@ fn bench_parallel_linear(
 
         let row_input = rand_array(device, &[SEQ_LEN, shard_in], 43);
 
-        let row_stats = run_bench("RowParallel    [7168->4096] (RDMA)", || {
+        let row_stats = run_bench("RowParallel    [9472->3584] (RDMA)", || {
             let _ = row_layer
                 .forward_with_group(&row_input, &dist.group, registry, queue)
                 .expect("row forward");
@@ -712,7 +712,7 @@ fn bench_parallel_linear(
 
         let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
 
-        let col_stats = run_bench("ColumnParallel [4096->7168] (half)", || {
+        let col_stats = run_bench("ColumnParallel [3584->9472] (half)", || {
             let _ = col_layer
                 .forward_with_group(&input, &dist.group, registry, queue)
                 .expect("col forward");
@@ -726,7 +726,7 @@ fn bench_parallel_linear(
 
         let row_input = rand_array(device, &[SEQ_LEN, INTERMEDIATE_DIM / 2], 43);
 
-        let row_stats = run_bench("RowParallel    [7168->4096] (half)", || {
+        let row_stats = run_bench("RowParallel    [9472->3584] (half)", || {
             let _ = row_layer
                 .forward_with_group(&row_input, &dist.group, registry, queue)
                 .expect("row forward");
@@ -847,7 +847,7 @@ fn main() {
     #[cfg(feature = "distributed")]
     let dist = init_distributed();
 
-    println!("\nConfig: Mixtral 8x7B-like single expert layer");
+    println!("\nConfig: Qwen 3.5 MoE A22B single expert layer");
     println!(
         "  hidden={}, heads={}/{}, head_dim={}, intermediate={}, seq_len={}",
         HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_DIM, SEQ_LEN
