@@ -41,7 +41,7 @@ done
 
 # ── Step 1: RDMA Setup ──
 if ! $SKIP_SETUP; then
-    echo -e "${BOLD}[1/4] RDMA Network Setup${NC}"
+    echo -e "${BOLD}[1/5] RDMA Network Setup${NC}"
     python3 "$SCRIPT_DIR/rdma_setup.py" \
         --node "$NODE1:en5:$NODE1_RDMA_IP" \
         --node "$NODE2:en5:$NODE2_RDMA_IP" \
@@ -50,7 +50,7 @@ if ! $SKIP_SETUP; then
 fi
 
 # ── Step 2: Build test binary on both nodes ──
-echo -e "${BOLD}[2/4] Building test binary${NC}"
+echo -e "${BOLD}[2/5] Building test binary${NC}"
 
 # Build on node1 and capture binary path
 BIN_PATH=$(ssh "$NODE1" "env -C /Users/hw/rmlx cargo test -p rmlx-distributed --test rdma_2node_integration --no-run 2>&1" \
@@ -77,10 +77,10 @@ ssh "$NODE2" "env -C /Users/hw/rmlx cargo test -p rmlx-distributed --test rdma_2
 echo ""
 
 # ── Step 2.5: RDMA cleanup ──
-echo -e "${BOLD}[2.5/4] RDMA resource cleanup${NC}"
+echo -e "${BOLD}[2.5/5] RDMA resource cleanup${NC}"
 # Kill any lingering test processes on both nodes
 for node in "$NODE1" "$NODE2"; do
-    ssh "$node" "env -C /tmp bash -c 'pkill -f rdma_2node_integration 2>/dev/null; sleep 1; echo cleaned'" 2>/dev/null || true
+    ssh "$node" "env -C /tmp bash -c 'pkill -f rdma_2node_integration 2>/dev/null; pkill -f tp_2node_e2e 2>/dev/null; sleep 1; echo cleaned'" 2>/dev/null || true
 done
 sleep 2  # Let kernel release RDMA resources
 echo "  Done"
@@ -88,7 +88,7 @@ echo ""
 
 # ── Step 3: Single-node tests ──
 if ! $ONLY_2NODE; then
-    echo -e "${BOLD}[3/4] Single-node tests (${NODE1})${NC}"
+    echo -e "${BOLD}[3/5] Single-node tests (${NODE1})${NC}"
     if ssh "$NODE1" "env -C /Users/hw/rmlx \
         RMLX_TEST_RDMA=1 RMLX_RDMA_DEVICE=$RDMA_DEVICE \
         timeout $TIMEOUT cargo test -p rmlx-distributed --test rdma_2node_integration -- \
@@ -102,7 +102,7 @@ if ! $ONLY_2NODE; then
 fi
 
 # ── Step 4: 2-node tests (binary direct execution) ──
-echo -e "${BOLD}[4/4] 2-node tests${NC}"
+echo -e "${BOLD}[4/5] 2-node tests${NC}"
 
 # Single unified test: nocopy send + allreduce suite over one RDMA connection.
 TESTS=(
@@ -138,6 +138,53 @@ for entry in "${TESTS[@]}"; do
 
     if $ok; then pass "$test_name"; else fail "$test_name"; fi
 done
+
+echo ""
+
+# ── Step 5: TP E2E 2-node tests ──
+echo -e "${BOLD}[5/5] TP E2E 2-node tests${NC}"
+
+# Find TP test binary
+TP_BIN=$(ssh "$NODE1" "env -C /Users/hw/rmlx cargo test -p rmlx-distributed --test tp_2node_e2e --no-run 2>&1" \
+    | grep -o 'target/debug/deps/tp_2node_e2e-[a-f0-9]*' | head -1)
+
+if [[ -z "$TP_BIN" ]]; then
+    TP_BIN=$(ssh "$NODE1" "env -C /Users/hw/rmlx find target/debug/deps -name 'tp_2node_e2e-*' -type f -perm +111 2>/dev/null | head -1")
+fi
+
+if [[ -z "$TP_BIN" ]]; then
+    echo -e "  ${RED}ERROR: TP test binary not found${NC}"
+else
+    ssh "$NODE2" "env -C /Users/hw/rmlx test -x ./$TP_BIN" || {
+        ssh "$NODE2" "env -C /Users/hw/rmlx cargo test -p rmlx-distributed --test tp_2node_e2e --no-run 2>&1" | tail -2
+    }
+
+    echo -e "  TP Binary: $TP_BIN"
+
+    # Run TP test (single test, different port to avoid collision)
+    TP_PORT=$((BASE_PORT + 10))
+    echo -e "  ── ${BOLD}test_tp_2node_full_suite${NC} (port $TP_PORT)"
+
+    ENV_COMMON="RMLX_TEST_RDMA=1 RMLX_RDMA_DEVICE=$RDMA_DEVICE RMLX_TEST_2NODE=1 RMLX_WORLD_SIZE=2 RMLX_TEST_PORT=$TP_PORT"
+
+    # Client first (rank 1)
+    ssh "$NODE2" "env -C /Users/hw/rmlx \
+        $ENV_COMMON RMLX_RANK=1 RMLX_PEER_HOST=$NODE1_IP \
+        timeout $TIMEOUT ./$TP_BIN --ignored --exact test_tp_2node_full_suite 2>&1" &
+    pid2=$!
+    sleep 1
+    # Server (rank 0)
+    ssh "$NODE1" "env -C /Users/hw/rmlx \
+        $ENV_COMMON RMLX_RANK=0 RMLX_PEER_HOST=$NODE2_IP \
+        timeout $TIMEOUT ./$TP_BIN --ignored --exact test_tp_2node_full_suite 2>&1" &
+    pid1=$!
+
+    ok=true
+    wait $pid1 || { echo "    ${NODE1} rank=0 failed"; ok=false; }
+    wait $pid2 || { echo "    ${NODE2} rank=1 failed"; ok=false; }
+
+    if $ok; then pass "test_tp_2node_full_suite"; else fail "test_tp_2node_full_suite"; fi
+fi
 
 echo ""
 

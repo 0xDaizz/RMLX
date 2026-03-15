@@ -646,6 +646,95 @@ fn subtest_allreduce_in_place(group: &Group, rank: u32) {
     eprintln!("  subtest_allreduce_in_place: rank={rank} PASSED");
 }
 
+fn subtest_mr_cache(conn: &RdmaConnection, rank: u32) {
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let data_size = page_size * 4;
+
+    if rank == 0 {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let ret = unsafe { libc::posix_memalign(&mut ptr, page_size, data_size) };
+        assert_eq!(ret, 0, "posix_memalign failed");
+        unsafe {
+            std::ptr::write_bytes(ptr as *mut u8, 0xCD, data_size);
+        }
+        let data = unsafe { std::slice::from_raw_parts(ptr as *const u8, data_size) };
+
+        // First send (registers MR, caches it)
+        conn.chunked_send(data).expect("first send");
+        // Second send (should use cached MR)
+        conn.chunked_send(data).expect("second send (cached MR)");
+
+        unsafe {
+            libc::free(ptr);
+        }
+        eprintln!("  mr_cache: rank=0 sent {data_size} bytes twice");
+    } else {
+        let r1 = conn.chunked_recv(data_size).expect("first recv");
+        let r2 = conn.chunked_recv(data_size).expect("second recv");
+        assert_eq!(r1.len(), data_size);
+        assert_eq!(r1, r2, "both receives should be identical");
+        assert!(
+            r1.iter().all(|&b| b == 0xCD),
+            "received data should be all 0xCD"
+        );
+        eprintln!("  mr_cache: rank=1 verified {data_size} bytes x2");
+    }
+}
+
+fn subtest_broadcast(group: &Group, rank: u32) {
+    let data: Vec<u8> = if rank == 0 {
+        [42.0f32, 43.0, 44.0, 45.0]
+            .iter()
+            .flat_map(|f| f.to_ne_bytes())
+            .collect()
+    } else {
+        vec![0u8; 16] // receiver gets zeros initially
+    };
+    let result = group.broadcast(&data, 0).expect("broadcast should succeed");
+    let f32s: Vec<f32> = result
+        .chunks_exact(4)
+        .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(
+        f32s,
+        vec![42.0, 43.0, 44.0, 45.0],
+        "all ranks should receive broadcast data"
+    );
+    eprintln!("  subtest_broadcast: rank={rank} PASSED");
+}
+
+fn subtest_reduce_scatter(group: &Group, rank: u32) {
+    // Each rank has [1.0, 2.0, 3.0, 4.0] as f32
+    // Sum = [2.0, 4.0, 6.0, 8.0]
+    // Rank 0 gets [2.0, 4.0], Rank 1 gets [6.0, 8.0]
+    let data: Vec<u8> = [1.0f32, 2.0, 3.0, 4.0]
+        .iter()
+        .flat_map(|f| f.to_ne_bytes())
+        .collect();
+    let result = group
+        .reduce_scatter(&data)
+        .expect("reduce_scatter should succeed");
+    let f32s: Vec<f32> = result
+        .chunks_exact(4)
+        .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+    assert_eq!(f32s.len(), 2, "each rank should get 2 elements");
+    if rank == 0 {
+        assert!(
+            (f32s[0] - 2.0).abs() < 0.01 && (f32s[1] - 4.0).abs() < 0.01,
+            "rank 0 expected [2.0, 4.0], got {:?}",
+            f32s
+        );
+    } else {
+        assert!(
+            (f32s[0] - 6.0).abs() < 0.01 && (f32s[1] - 8.0).abs() < 0.01,
+            "rank 1 expected [6.0, 8.0], got {:?}",
+            f32s
+        );
+    }
+    eprintln!("  subtest_reduce_scatter: rank={rank} PASSED");
+}
+
 fn subtest_large_allreduce(group: &Group, rank: u32) {
     // 1MB of f16 data = 524288 elements
     let num_elements: usize = 524288;
@@ -695,6 +784,9 @@ fn test_2node_full_suite() {
     eprintln!("=== Phase 1: nocopy chunked send ===");
     subtest_nocopy_send(&conn, rank);
 
+    eprintln!("=== Phase 1b: MR cache verification ===");
+    subtest_mr_cache(&conn, rank);
+
     // Phase 2+: Wrap connection as Group for collective tests
     let peer_rank = 1 - rank;
     let mut connections: Vec<Option<RdmaConnection>> = vec![None, None];
@@ -714,6 +806,12 @@ fn test_2node_full_suite() {
 
     eprintln!("=== Phase 5: large allreduce (1MB f16) ===");
     subtest_large_allreduce(&group, rank);
+
+    eprintln!("=== Phase 6: broadcast ===");
+    subtest_broadcast(&group, rank);
+
+    eprintln!("=== Phase 7: reduce_scatter ===");
+    subtest_reduce_scatter(&group, rank);
 
     // Exit barrier: ensure both ranks complete before dropping connection
     let _ = group.allreduce(&[0u8; 4]);
