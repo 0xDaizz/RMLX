@@ -19,7 +19,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use rmlx_rdma::connection::{RdmaConfig, RdmaConnection, SharedRdmaBuffer};
+use rmlx_rdma::connection::{RdmaBufferPool, RdmaConfig, RdmaConnection};
 use rmlx_rdma::context::RdmaContext;
 use rmlx_rdma::coordinator::CoordinatorConfig;
 use rmlx_rdma::device_file::DeviceMap;
@@ -333,8 +333,7 @@ fn try_rdma_init(
         pd: rmlx_rdma::context::ProtectionDomain,
         cq: CompletionQueue,
         qp: QueuePair,
-        send_buf: Option<SharedRdmaBuffer>,
-        recv_buf: Option<SharedRdmaBuffer>,
+        pool: Option<RdmaBufferPool>,
     }
 
     let mut slots: Vec<Option<QpSlot>> = (0..world_size).map(|_| None).collect();
@@ -372,14 +371,19 @@ fn try_rdma_init(
         local_infos[peer as usize] = qp.local_info().clone();
 
         // JACCL pattern: register MR before QP connect (QP is in RESET state)
-        let send_buf = SharedRdmaBuffer::new(&pd, 4096)
-            .inspect_err(|e| eprintln!("[rdma-init] WARNING: send_buf alloc failed for peer={peer}: {e}"))
-            .ok();
-        let recv_buf = SharedRdmaBuffer::new(&pd, 4096)
-            .inspect_err(|e| eprintln!("[rdma-init] WARNING: recv_buf alloc failed for peer={peer}: {e}"))
+        let pool = RdmaBufferPool::new(&pd)
+            .inspect_err(|e| {
+                eprintln!("[rdma-init] WARNING: buffer pool alloc failed for peer={peer}: {e}")
+            })
             .ok();
 
-        slots[peer as usize] = Some(QpSlot { ctx, pd, cq, qp, send_buf, recv_buf });
+        slots[peer as usize] = Some(QpSlot {
+            ctx,
+            pd,
+            cq,
+            qp,
+            pool,
+        });
     }
     eprintln!("[rdma-init] Phase 1a complete, starting coordinator exchange...");
 
@@ -483,8 +487,7 @@ fn try_rdma_init(
             slot.cq,
             slot.qp,
             peer_config,
-            slot.send_buf,
-            slot.recv_buf,
+            slot.pool,
         ));
     }
 
@@ -496,7 +499,11 @@ fn try_rdma_init(
     let barrier_buf = vec![rank as u8; 1];
     let hub_host_barrier = if rank == 0 { "" } else { &coordinator_addr };
     let _barrier_result = rmlx_rdma::coordinator::all_gather_bytes(
-        rank, world_size, &barrier_buf, hub_host_barrier, &coord_cfg,
+        rank,
+        world_size,
+        &barrier_buf,
+        hub_host_barrier,
+        &coord_cfg,
     )
     .map_err(|e| DistributedError::Transport(format!("post-connect barrier failed: {e}")))?;
     eprintln!("[rdma-init] Post-connect barrier OK");

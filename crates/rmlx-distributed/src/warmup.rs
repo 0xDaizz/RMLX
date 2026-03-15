@@ -187,7 +187,10 @@ impl WarmupState {
 
         // D18: Threshold calibration — auto-tune CPU/GPU crossover point.
         let mut cal_dur = Duration::ZERO;
-        eprintln!("[warmup] run_calibration={}, calibrated={}", config.run_calibration, self.calibration.calibrated);
+        eprintln!(
+            "[warmup] run_calibration={}, calibrated={}",
+            config.run_calibration, self.calibration.calibrated
+        );
         if config.run_calibration && !self.calibration.calibrated {
             let calibration_gpu = MTLCreateSystemDefaultDevice();
             let cal_start = Instant::now();

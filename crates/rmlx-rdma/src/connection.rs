@@ -18,12 +18,24 @@ use crate::qp::{CompletionQueue, QueuePair};
 use crate::shared_buffer::{ConnectionId, SharedBuffer};
 use crate::RdmaError;
 
-/// Default size for pre-registered send/recv buffers.
-/// JACCL uses tiered pools (4KB-512KB) with PIPELINE=2 chunking.
-/// We use a single buffer sized to fit common tensor transfers.
-/// Max single MR on macOS TB5 is ~16MB, but we cap at 1MB to match
-/// JACCL's largest single-chunk size.
-const SHARED_BUF_SIZE: usize = 1024 * 1024; // 1 MB
+/// JACCL-compatible buffer pool constants.
+const FRAME_SIZE: usize = 4096; // 4KB base unit
+const BUFFER_SIZES: usize = 8; // 8 tiers: 4KB, 8KB, 16KB, 32KB, 64KB, 128KB, 256KB, 512KB
+const NUM_BUFFERS: usize = 2; // Ping-pong buffers per tier (PIPELINE depth)
+
+/// Select buffer tier for a message size. Returns (tier_index, chunk_size).
+fn buffer_size_from_message(msg_bytes: usize) -> (usize, usize) {
+    if msg_bytes == 0 {
+        return (0, FRAME_SIZE);
+    }
+    for k in (1..BUFFER_SIZES).rev() {
+        let size = FRAME_SIZE * (1 << k);
+        if msg_bytes >= size {
+            return (k, size);
+        }
+    }
+    (0, FRAME_SIZE)
+}
 
 /// Pre-registered RDMA buffer (JACCL SharedBuffer equivalent).
 ///
@@ -42,7 +54,11 @@ impl SharedRdmaBuffer {
     pub fn new(pd: &ProtectionDomain, size: usize) -> Result<Self, RdmaError> {
         let lib = pd.lib();
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-        let page_size = if page_size > 0 { page_size as usize } else { 16384 };
+        let page_size = if page_size > 0 {
+            page_size as usize
+        } else {
+            16384
+        };
         // posix_memalign requires size >= alignment, so allocate at least
         // page_size bytes.  However, ibv_reg_mr should register only the
         // actually requested size — macOS TB5 limits 16 KB MRs to 1 per PD,
@@ -99,7 +115,12 @@ impl SharedRdmaBuffer {
     /// # Panics
     /// Panics if `data.len() > self.size`.
     pub fn copy_from(&self, data: &[u8]) {
-        assert!(data.len() <= self.size, "SharedRdmaBuffer overflow: {} > {}", data.len(), self.size);
+        assert!(
+            data.len() <= self.size,
+            "SharedRdmaBuffer overflow: {} > {}",
+            data.len(),
+            self.size
+        );
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), self.buf as *mut u8, data.len());
         }
@@ -121,7 +142,9 @@ impl Drop for SharedRdmaBuffer {
         unsafe {
             let ret = (self.lib.dereg_mr)(self.mr);
             if ret != 0 {
-                eprintln!("[SharedRdmaBuffer] WARNING: ibv_dereg_mr returned {ret}, leaking buffer");
+                eprintln!(
+                    "[SharedRdmaBuffer] WARNING: ibv_dereg_mr returned {ret}, leaking buffer"
+                );
                 return;
             }
             libc::free(self.buf);
@@ -131,6 +154,34 @@ impl Drop for SharedRdmaBuffer {
 
 // SAFETY: SharedRdmaBuffer owns its allocation and MR handle exclusively.
 unsafe impl Send for SharedRdmaBuffer {}
+
+/// Pre-registered buffer pool for pipelined RDMA transfers.
+/// Organized as [tier][buffer_index] for send and recv separately.
+/// tier 0 = FRAME_SIZE (4KB), tier 7 = 512KB.
+pub struct RdmaBufferPool {
+    send: Vec<Vec<SharedRdmaBuffer>>, // [BUFFER_SIZES][NUM_BUFFERS]
+    recv: Vec<Vec<SharedRdmaBuffer>>, // [BUFFER_SIZES][NUM_BUFFERS]
+}
+
+impl RdmaBufferPool {
+    /// Allocate all tiered send/recv buffers and register them as MRs.
+    pub fn new(pd: &ProtectionDomain) -> Result<Self, RdmaError> {
+        let mut send = Vec::with_capacity(BUFFER_SIZES);
+        let mut recv = Vec::with_capacity(BUFFER_SIZES);
+        for k in 0..BUFFER_SIZES {
+            let size = FRAME_SIZE * (1 << k);
+            let mut send_tier = Vec::with_capacity(NUM_BUFFERS);
+            let mut recv_tier = Vec::with_capacity(NUM_BUFFERS);
+            for _ in 0..NUM_BUFFERS {
+                send_tier.push(SharedRdmaBuffer::new(pd, size)?);
+                recv_tier.push(SharedRdmaBuffer::new(pd, size)?);
+            }
+            send.push(send_tier);
+            recv.push(recv_tier);
+        }
+        Ok(Self { send, recv })
+    }
+}
 
 /// The kind of RDMA work request that was posted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -237,7 +288,8 @@ impl CompletionTracker {
             if !is_recv && wc.status != wc_status::SUCCESS {
                 return Err(RdmaError::CqPoll(format!(
                     "wc status={} ({}) for wr_id={wr_id}",
-                    wc.status, wc_status_str(wc.status)
+                    wc.status,
+                    wc_status_str(wc.status)
                 )));
             }
             self.completed.push(wr_id);
@@ -256,7 +308,8 @@ impl CompletionTracker {
                     if !is_recv && wc.status != wc_status::SUCCESS {
                         return Err(RdmaError::CqPoll(format!(
                             "wc status={} ({}) for wr_id={wr_id}",
-                            wc.status, wc_status_str(wc.status)
+                            wc.status,
+                            wc_status_str(wc.status)
                         )));
                     }
                     self.completed.push(wr_id);
@@ -374,7 +427,7 @@ impl<'a> RegisteredRecv<'a> {
 ///
 /// Drop order (top to bottom):
 /// 1. completion_backlog, config — plain data (no RDMA teardown)
-/// 2. send_buf, recv_buf — MR deregister (must precede QP destroy)
+/// 2. pool — tiered buffer MRs deregister (must precede QP destroy)
 /// 3. mr_pool — MR deregister
 /// 4. qp — QP destroy
 /// 5. cq — CQ destroy
@@ -385,12 +438,9 @@ pub struct RdmaConnection {
     /// Backlog of CQ completions with unexpected wr_ids, for later retrieval.
     /// Protected by a Mutex for thread-safe access (IbvWc is Copy + Send).
     completion_backlog: Mutex<Vec<IbvWc>>,
-    /// Pre-registered send buffer (JACCL SharedBuffer pattern).
-    /// Allocated once at connection creation, reused for all sends.
-    send_buf: Option<SharedRdmaBuffer>,
-    /// Pre-registered recv buffer (JACCL SharedBuffer pattern).
-    /// Allocated once at connection creation, reused for all recvs.
-    recv_buf: Option<SharedRdmaBuffer>,
+    /// Pre-registered tiered buffer pool (JACCL chunked transfer pattern).
+    /// Allocated once at connection creation, reused for all sends/recvs.
+    pool: Option<RdmaBufferPool>,
     /// Pre-registered MR pool (lazily initialized via `init_mr_pool`).
     mr_pool: Option<MrPool>,
     qp: QueuePair,
@@ -420,14 +470,12 @@ impl RdmaConnection {
         cq: CompletionQueue,
         qp: QueuePair,
         config: RdmaConfig,
-        send_buf: Option<SharedRdmaBuffer>,
-        recv_buf: Option<SharedRdmaBuffer>,
+        pool: Option<RdmaBufferPool>,
     ) -> Self {
         Self {
             config,
             completion_backlog: Mutex::new(Vec::new()),
-            send_buf,
-            recv_buf,
+            pool,
             mr_pool: None,
             qp,
             cq,
@@ -475,19 +523,15 @@ impl RdmaConnection {
         // 4. Connect QP (RESET → INIT → RTR → RTS)
         qp.connect(&remote_info)?;
 
-        // Pre-register send/recv buffers (best-effort; None on failure)
-        let send_buf = SharedRdmaBuffer::new(&pd, SHARED_BUF_SIZE)
-            .inspect_err(|e| eprintln!("[rdma] send_buf alloc failed: {e}"))
-            .ok();
-        let recv_buf = SharedRdmaBuffer::new(&pd, SHARED_BUF_SIZE)
-            .inspect_err(|e| eprintln!("[rdma] recv_buf alloc failed: {e}"))
+        // Pre-register tiered buffer pool (best-effort; None on failure)
+        let pool = RdmaBufferPool::new(&pd)
+            .inspect_err(|e| eprintln!("[rdma] buffer pool alloc failed: {e}"))
             .ok();
 
         Ok(Self {
             config,
             completion_backlog: Mutex::new(Vec::new()),
-            send_buf,
-            recv_buf,
+            pool,
             mr_pool: None,
             qp,
             cq,
@@ -694,7 +738,9 @@ impl RdmaConnection {
                     if !is_recv && wc.status != wc_status::SUCCESS {
                         backlog_error = Some(RdmaError::CqPoll(format!(
                             "backlog: wr_id {} failed with status {} ({})",
-                            wr_id, wc.status, wc_status_str(wc.status)
+                            wr_id,
+                            wc.status,
+                            wc_status_str(wc.status)
                         )));
                     }
                     false // found, remove from remaining
@@ -718,7 +764,9 @@ impl RdmaConnection {
                     if !is_recv && wc.status != wc_status::SUCCESS {
                         return Err(RdmaError::CqPoll(format!(
                             "wc status={} ({}) for wr_id={}",
-                            wc.status, wc_status_str(wc.status), wc.wr_id,
+                            wc.status,
+                            wc_status_str(wc.status),
+                            wc.wr_id,
                         )));
                     }
                     remaining.swap_remove(pos);
@@ -893,105 +941,406 @@ impl RdmaConnection {
         self.post_recv(mr, offset, length, wr_id)
     }
 
-    // ─── Pre-registered buffer operations (JACCL SharedBuffer pattern) ───
+    // ─── Chunked RDMA transfer (JACCL pipelined buffer pool pattern) ───
 
-    /// Post a send using the pre-registered send buffer.
-    ///
-    /// Copies `data` into the internal send buffer and posts the send using
-    /// its already-registered MR — no `ibv_reg_mr` / `ibv_dereg_mr` on the
-    /// hot path.
-    ///
-    /// Falls back to `register_send_slice` if the pre-registered buffer is
-    /// unavailable or too small.
-    pub fn send_buffered(&self, data: &[u8], wr_id: u64) -> Result<(), RdmaError> {
-        let sbuf = match self.send_buf.as_ref() {
-            Some(b) if data.len() <= b.size() => b,
-            _ => {
-                // Fallback: register on-the-fly
-                let reg = self.register_send_slice(data)?;
-                let _op = self.post_send(reg.mr(), 0, data.len() as u32, wr_id)?;
-                // macOS TB5 RDMA driver bug: skip CQ polling.
-                std::thread::sleep(Duration::from_millis(1));
-                return Ok(());
-            }
-        };
-
-        sbuf.copy_from(data);
-
-        let mut sge = IbvSge {
-            addr: sbuf.addr(),
-            length: sbuf.size() as u32, // JACCL: always send full buffer size
-            lkey: sbuf.lkey(),
-        };
-
-        // JACCL compatible: leave unused fields uninitialized instead of zeroed.
-        // macOS TB5 driver may interpret zero values in imm_data/wr union differently.
-        #[allow(invalid_value)]
-        let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-        wr.wr_id = wr_id;
-        wr.next = std::ptr::null_mut();
-        wr.sg_list = &mut sge;
-        wr.num_sge = 1;
-        wr.opcode = wr_opcode::SEND;
-        wr.send_flags = send_flags::SIGNALED;
-
-        self.qp.post_send(&mut wr)?;
-        Ok(())
+    /// Whether the tiered buffer pool is available.
+    pub fn has_pool(&self) -> bool {
+        self.pool.is_some()
     }
 
-    /// Post a recv using the pre-registered recv buffer.
-    ///
-    /// Posts a recv for `len` bytes using the internal recv buffer's
-    /// already-registered MR. After completion, call `read_recv_buf` to
-    /// retrieve the received data.
-    ///
-    /// Returns `Err` if the pre-registered buffer is unavailable or too small.
-    pub fn recv_buffered(&self, len: usize, wr_id: u64) -> Result<(), RdmaError> {
-        let rbuf = match self.recv_buf.as_ref() {
-            Some(b) if len <= b.size() => b,
-            _ => {
-                // Fallback: register on-the-fly (mirrors send_buffered)
-                let mut tmp = vec![0u8; len];
-                let reg = self.register_recv_slice(&mut tmp)?;
-                let _op = self.post_recv(reg.mr(), 0, len as u32, wr_id)?;
-                // macOS TB5 RDMA driver bug: skip CQ polling.
-                std::thread::sleep(Duration::from_millis(1));
-                return Ok(());
-            }
-        };
+    /// Chunked send using PIPELINE=2 pipelining through tiered buffer pool.
+    /// Handles arbitrary message sizes by streaming through pre-registered buffers.
+    pub fn chunked_send(&self, data: &[u8]) -> Result<(), RdmaError> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| RdmaError::InvalidArgument("buffer pool not available".into()))?;
 
-        let mut sge = IbvSge {
-            addr: rbuf.addr(),
-            length: rbuf.size() as u32, // JACCL: always use full buffer size for recv
-            lkey: rbuf.lkey(),
-        };
-
-        let mut wr = IbvRecvWr {
-            wr_id,
-            next: std::ptr::null_mut(),
-            sg_list: &mut sge,
-            num_sge: 1,
-        };
-
-        self.qp.post_recv(&mut wr)?;
-        Ok(())
-    }
-
-    /// Read received data from the pre-registered recv buffer.
-    ///
-    /// Must be called after recv completion to copy data out of the
-    /// internal buffer. Returns an empty Vec if the recv buffer is
-    /// unavailable.
-    pub fn read_recv_buf(&self, len: usize) -> Vec<u8> {
-        match self.recv_buf.as_ref() {
-            Some(rbuf) => rbuf.read(len),
-            None => Vec::new(),
+        if data.is_empty() {
+            return Ok(());
         }
+
+        let (tier, chunk_size) = buffer_size_from_message(data.len());
+        let send_total = data.len();
+        let mut send_offset: usize = 0;
+        let mut in_flight: u32 = 0;
+        let mut wc_buf: [IbvWc; 4] = core::array::from_fn(|_| IbvWc::zeroed());
+
+        const SEND_WR: u64 = 1;
+
+        // Post initial sends (up to NUM_BUFFERS)
+        let mut buf_idx = 0;
+        while send_offset < send_total && buf_idx < NUM_BUFFERS {
+            let chunk = (send_total - send_offset).min(chunk_size);
+            let sbuf = &pool.send[tier][buf_idx];
+            sbuf.copy_from(&data[send_offset..send_offset + chunk]);
+
+            let mut sge = IbvSge {
+                addr: sbuf.addr(),
+                length: sbuf.size() as u32,
+                lkey: sbuf.lkey(),
+            };
+            let wr_id = (SEND_WR << 16) | (buf_idx as u64) << 8;
+            #[allow(invalid_value)]
+            let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+            wr.wr_id = wr_id;
+            wr.next = std::ptr::null_mut();
+            wr.sg_list = &mut sge;
+            wr.num_sge = 1;
+            wr.opcode = wr_opcode::SEND;
+            wr.send_flags = send_flags::SIGNALED;
+
+            self.qp.post_send(&mut wr)?;
+            in_flight += 1;
+            send_offset += chunk_size;
+            buf_idx += 1;
+        }
+
+        // Poll loop with 5-second rolling timeout (JACCL pattern)
+        let mut deadline = Instant::now() + Duration::from_secs(5);
+        while in_flight > 0 {
+            let count = self.cq.poll(&mut wc_buf)?;
+            if count > 0 {
+                deadline = Instant::now() + Duration::from_secs(5);
+            }
+
+            for wc in &wc_buf[..count] {
+                let buf_idx = ((wc.wr_id >> 8) & 0xff) as usize;
+
+                if wc.status != wc_status::SUCCESS {
+                    return Err(RdmaError::CqPoll(format!(
+                        "chunked_send: send wc status={} ({})",
+                        wc.status,
+                        wc_status_str(wc.status)
+                    )));
+                }
+
+                in_flight -= 1;
+
+                // Send completed — post next chunk if available
+                if send_offset < send_total {
+                    let chunk = (send_total - send_offset).min(chunk_size);
+                    let sbuf = &pool.send[tier][buf_idx];
+                    sbuf.copy_from(&data[send_offset..send_offset + chunk]);
+
+                    let mut sge = IbvSge {
+                        addr: sbuf.addr(),
+                        length: sbuf.size() as u32,
+                        lkey: sbuf.lkey(),
+                    };
+                    let wr_id = (SEND_WR << 16) | (buf_idx as u64) << 8;
+                    #[allow(invalid_value)]
+                    let mut wr: IbvSendWr =
+                        unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+                    wr.wr_id = wr_id;
+                    wr.next = std::ptr::null_mut();
+                    wr.sg_list = &mut sge;
+                    wr.num_sge = 1;
+                    wr.opcode = wr_opcode::SEND;
+                    wr.send_flags = send_flags::SIGNALED;
+
+                    self.qp.post_send(&mut wr)?;
+                    in_flight += 1;
+                    send_offset += chunk_size;
+                }
+            }
+
+            if in_flight > 0 && Instant::now() >= deadline {
+                return Err(RdmaError::Timeout(format!(
+                    "chunked_send: timeout (in_flight={in_flight})"
+                )));
+            }
+            if in_flight > 0 && count == 0 {
+                std::thread::yield_now();
+            }
+        }
+
+        Ok(())
     }
 
-    /// Whether pre-registered send/recv buffers are available.
-    pub fn has_shared_buffers(&self) -> bool {
-        self.send_buf.is_some() && self.recv_buf.is_some()
+    /// Chunked recv using PIPELINE=2 pipelining through tiered buffer pool.
+    /// Handles arbitrary message sizes by streaming through pre-registered buffers.
+    pub fn chunked_recv(&self, len: usize) -> Result<Vec<u8>, RdmaError> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| RdmaError::InvalidArgument("buffer pool not available".into()))?;
+
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+
+        let (tier, chunk_size) = buffer_size_from_message(len);
+        let recv_total = len;
+        let mut recv_offset: usize = 0;
+        let mut in_flight: u32 = 0;
+        let mut wc_buf: [IbvWc; 4] = core::array::from_fn(|_| IbvWc::zeroed());
+        let mut recv_result = vec![0u8; recv_total];
+
+        const RECV_WR: u64 = 2;
+
+        // Post initial recvs (up to NUM_BUFFERS)
+        let mut buf_idx = 0;
+        while (chunk_size as u64) * (buf_idx as u64) < recv_total as u64 && buf_idx < NUM_BUFFERS {
+            let rbuf = &pool.recv[tier][buf_idx];
+            let mut sge = IbvSge {
+                addr: rbuf.addr(),
+                length: rbuf.size() as u32,
+                lkey: rbuf.lkey(),
+            };
+            let wr_id = (RECV_WR << 16) | (buf_idx as u64) << 8;
+            let mut wr = IbvRecvWr {
+                wr_id,
+                next: std::ptr::null_mut(),
+                sg_list: &mut sge,
+                num_sge: 1,
+            };
+            self.qp.post_recv(&mut wr)?;
+            in_flight += 1;
+            buf_idx += 1;
+        }
+
+        // Poll loop with 5-second rolling timeout (JACCL pattern)
+        let mut deadline = Instant::now() + Duration::from_secs(5);
+        while in_flight > 0 {
+            let count = self.cq.poll(&mut wc_buf)?;
+            if count > 0 {
+                deadline = Instant::now() + Duration::from_secs(5);
+            }
+
+            for wc in &wc_buf[..count] {
+                let buf_idx = ((wc.wr_id >> 8) & 0xff) as usize;
+
+                // UC recv may report non-zero status but data arrives correctly
+                in_flight -= 1;
+
+                // Recv completed — copy data out
+                let chunk = (recv_total - recv_offset).min(chunk_size);
+                if chunk > 0 {
+                    let rbuf = &pool.recv[tier][buf_idx];
+                    let src = rbuf.read(chunk);
+                    recv_result[recv_offset..recv_offset + chunk].copy_from_slice(&src);
+                    recv_offset += chunk_size;
+                }
+
+                // Post next recv if more data expected
+                let remaining_recvs = if recv_total > recv_offset {
+                    (recv_total - recv_offset).div_ceil(chunk_size)
+                } else {
+                    0
+                };
+                if remaining_recvs > 0 {
+                    let rbuf = &pool.recv[tier][buf_idx];
+                    let mut sge = IbvSge {
+                        addr: rbuf.addr(),
+                        length: rbuf.size() as u32,
+                        lkey: rbuf.lkey(),
+                    };
+                    let wr_id = (RECV_WR << 16) | (buf_idx as u64) << 8;
+                    let mut wr = IbvRecvWr {
+                        wr_id,
+                        next: std::ptr::null_mut(),
+                        sg_list: &mut sge,
+                        num_sge: 1,
+                    };
+                    self.qp.post_recv(&mut wr)?;
+                    in_flight += 1;
+                }
+            }
+
+            if in_flight > 0 && Instant::now() >= deadline {
+                return Err(RdmaError::Timeout(format!(
+                    "chunked_recv: timeout (in_flight={in_flight})"
+                )));
+            }
+            if in_flight > 0 && count == 0 {
+                std::thread::yield_now();
+            }
+        }
+
+        Ok(recv_result)
+    }
+
+    /// Chunked bidirectional sendrecv using PIPELINE=2 pipelining.
+    /// Handles arbitrary message sizes by streaming through tiered buffer pool.
+    pub fn chunked_sendrecv(
+        &self,
+        send_data: &[u8],
+        recv_len: usize,
+    ) -> Result<Vec<u8>, RdmaError> {
+        let pool = self
+            .pool
+            .as_ref()
+            .ok_or_else(|| RdmaError::InvalidArgument("buffer pool not available".into()))?;
+
+        let max_bytes = send_data.len().max(recv_len).max(1);
+        let (tier, chunk_size) = buffer_size_from_message(max_bytes);
+
+        let mut recv_result = vec![0u8; recv_len];
+        let mut send_offset: usize = 0;
+        let mut recv_offset: usize = 0;
+        let send_total = send_data.len();
+        let recv_total = recv_len;
+
+        let mut in_flight: u32 = 0;
+        let mut wc_buf: [IbvWc; 4] = core::array::from_fn(|_| IbvWc::zeroed());
+
+        // Encode wr_id: (type << 16) | (buf_idx << 8) — JACCL pattern
+        const SEND_WR: u64 = 1;
+        const RECV_WR: u64 = 2;
+
+        // Prefill: post recvs first (UC mode requires recv before send)
+        if recv_total > 0 {
+            let mut buf_idx = 0;
+            while (chunk_size as u64) * (buf_idx as u64) < recv_total as u64
+                && buf_idx < NUM_BUFFERS
+            {
+                let rbuf = &pool.recv[tier][buf_idx];
+                let mut sge = IbvSge {
+                    addr: rbuf.addr(),
+                    length: rbuf.size() as u32,
+                    lkey: rbuf.lkey(),
+                };
+                let wr_id = (RECV_WR << 16) | (buf_idx as u64) << 8;
+                let mut wr = IbvRecvWr {
+                    wr_id,
+                    next: std::ptr::null_mut(),
+                    sg_list: &mut sge,
+                    num_sge: 1,
+                };
+                self.qp.post_recv(&mut wr)?;
+                in_flight += 1;
+                buf_idx += 1;
+            }
+        }
+
+        // Post sends
+        if send_total > 0 {
+            let mut buf_idx = 0;
+            while send_offset < send_total && buf_idx < NUM_BUFFERS {
+                let chunk = (send_total - send_offset).min(chunk_size);
+                let sbuf = &pool.send[tier][buf_idx];
+                sbuf.copy_from(&send_data[send_offset..send_offset + chunk]);
+
+                let mut sge = IbvSge {
+                    addr: sbuf.addr(),
+                    length: sbuf.size() as u32,
+                    lkey: sbuf.lkey(),
+                };
+                let wr_id = (SEND_WR << 16) | (buf_idx as u64) << 8;
+                #[allow(invalid_value)]
+                let mut wr: IbvSendWr = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+                wr.wr_id = wr_id;
+                wr.next = std::ptr::null_mut();
+                wr.sg_list = &mut sge;
+                wr.num_sge = 1;
+                wr.opcode = wr_opcode::SEND;
+                wr.send_flags = send_flags::SIGNALED;
+
+                self.qp.post_send(&mut wr)?;
+                in_flight += 1;
+                send_offset += chunk_size;
+                buf_idx += 1;
+            }
+        }
+
+        // Poll loop with 5-second rolling timeout (JACCL pattern)
+        let mut deadline = Instant::now() + Duration::from_secs(5);
+        while in_flight > 0 {
+            let count = self.cq.poll(&mut wc_buf)?;
+            if count > 0 {
+                deadline = Instant::now() + Duration::from_secs(5);
+            }
+
+            for wc in &wc_buf[..count] {
+                let work_type = wc.wr_id >> 16;
+                let buf_idx = ((wc.wr_id >> 8) & 0xff) as usize;
+
+                // UC recv may report non-zero status but data arrives correctly
+                let is_recv = work_type == RECV_WR;
+                if !is_recv && wc.status != wc_status::SUCCESS {
+                    return Err(RdmaError::CqPoll(format!(
+                        "chunked_sendrecv: send wc status={} ({})",
+                        wc.status,
+                        wc_status_str(wc.status)
+                    )));
+                }
+
+                in_flight -= 1;
+
+                if work_type == SEND_WR {
+                    // Send completed — post next chunk if available
+                    if send_offset < send_total {
+                        let chunk = (send_total - send_offset).min(chunk_size);
+                        let sbuf = &pool.send[tier][buf_idx];
+                        sbuf.copy_from(&send_data[send_offset..send_offset + chunk]);
+
+                        let mut sge = IbvSge {
+                            addr: sbuf.addr(),
+                            length: sbuf.size() as u32,
+                            lkey: sbuf.lkey(),
+                        };
+                        let wr_id = (SEND_WR << 16) | (buf_idx as u64) << 8;
+                        #[allow(invalid_value)]
+                        let mut wr: IbvSendWr =
+                            unsafe { std::mem::MaybeUninit::uninit().assume_init() };
+                        wr.wr_id = wr_id;
+                        wr.next = std::ptr::null_mut();
+                        wr.sg_list = &mut sge;
+                        wr.num_sge = 1;
+                        wr.opcode = wr_opcode::SEND;
+                        wr.send_flags = send_flags::SIGNALED;
+
+                        self.qp.post_send(&mut wr)?;
+                        in_flight += 1;
+                        send_offset += chunk_size;
+                    }
+                } else if work_type == RECV_WR {
+                    // Recv completed — copy data out and post next recv if needed
+                    let chunk = (recv_total - recv_offset).min(chunk_size);
+                    if chunk > 0 {
+                        let rbuf = &pool.recv[tier][buf_idx];
+                        let src = rbuf.read(chunk);
+                        recv_result[recv_offset..recv_offset + chunk].copy_from_slice(&src);
+                        recv_offset += chunk_size;
+                    }
+                    // Post next recv if more data expected
+                    let remaining_recvs = if recv_total > recv_offset {
+                        (recv_total - recv_offset).div_ceil(chunk_size)
+                    } else {
+                        0
+                    };
+                    if remaining_recvs > 0 {
+                        let rbuf = &pool.recv[tier][buf_idx];
+                        let mut sge = IbvSge {
+                            addr: rbuf.addr(),
+                            length: rbuf.size() as u32,
+                            lkey: rbuf.lkey(),
+                        };
+                        let wr_id = (RECV_WR << 16) | (buf_idx as u64) << 8;
+                        let mut wr = IbvRecvWr {
+                            wr_id,
+                            next: std::ptr::null_mut(),
+                            sg_list: &mut sge,
+                            num_sge: 1,
+                        };
+                        self.qp.post_recv(&mut wr)?;
+                        in_flight += 1;
+                    }
+                }
+            }
+
+            if in_flight > 0 && Instant::now() >= deadline {
+                return Err(RdmaError::Timeout(format!(
+                    "chunked_sendrecv: timeout (in_flight={in_flight})"
+                )));
+            }
+            if in_flight > 0 && count == 0 {
+                std::thread::yield_now();
+            }
+        }
+
+        Ok(recv_result)
     }
 }
 

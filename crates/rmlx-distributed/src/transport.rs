@@ -136,10 +136,7 @@ impl RdmaConnectionTransport {
         let world_size = connections.len();
         let wr_id_seqs: Vec<AtomicU64> = (0..world_size).map(|_| AtomicU64::new(0)).collect();
         Self {
-            connections: connections
-                .into_iter()
-                .map(|c| c.map(Mutex::new))
-                .collect(),
+            connections: connections.into_iter().map(|c| c.map(Mutex::new)).collect(),
             local_rank,
             metrics: Arc::new(RdmaMetrics::new()),
             stripe_engine: None,
@@ -929,13 +926,11 @@ impl RdmaTransport for RdmaConnectionTransport {
             return self.send_striped(data, dst_rank, &conn);
         }
 
-        let wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
-
-        // Use pre-registered buffer (no ibv_reg_mr on hot path)
+        // Use chunked send with tiered buffer pool (JACCL pipelining)
         global_counters().record_rdma_transfer(data.len() as u64);
-        conn.send_buffered(data, wr_id).map_err(|e| {
+        conn.chunked_send(data).map_err(|e| {
             self.metrics.record_send_error();
-            rdma_to_distributed_enhanced(e, wr_id)
+            rdma_to_distributed(e)
         })?;
 
         self.metrics.record_send(data.len() as u64);
@@ -951,26 +946,13 @@ impl RdmaTransport for RdmaConnectionTransport {
             return self.recv_striped(src_rank, len, &conn);
         }
 
-        let wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
-
-        // Use pre-registered buffer (no ibv_reg_mr on hot path)
+        // Use chunked recv with tiered buffer pool (JACCL pipelining)
+        // CQ polling is handled internally by chunked_recv.
         global_counters().record_rdma_transfer(len as u64);
-        conn.recv_buffered(len, wr_id).map_err(|e| {
+        let buf = conn.chunked_recv(len).map_err(|e| {
             self.metrics.record_recv_error();
-            rdma_to_distributed_enhanced(e, wr_id)
+            rdma_to_distributed(e)
         })?;
-
-        // Wait for recv completion via CQ polling.
-        // Previously we skipped CQ polling due to a macOS TB5 driver bug where
-        // recv completions returned status=4 (LOC_PROT_ERR), corrupting the RQ.
-        // Root causes have since been fixed (MaybeUninit WR, MR registration in
-        // RESET state — commit 084bdce), and recv completions now return status=0.
-        // sendrecv() already polls CQ successfully for barrier/allgather.
-        conn.wait_completions(&[wr_id]).map_err(|e| {
-            rdma_to_distributed_enhanced(e, wr_id)
-        })?;
-
-        let buf = conn.read_recv_buf(len);
 
         self.metrics.record_recv(len as u64);
         Ok(buf)
@@ -984,38 +966,19 @@ impl RdmaTransport for RdmaConnectionTransport {
         src_rank: u32,
     ) -> Result<Vec<u8>, DistributedError> {
         global_counters().record_fallback();
-        // UC mode requires recv to be posted before the matching send arrives,
-        // otherwise data is silently dropped. Pattern: post_recv → post_send → wait(both).
-        //
-        // Uses pre-registered send/recv buffers (JACCL SharedBuffer pattern)
-        // to avoid ibv_reg_mr / ibv_dereg_mr on every transfer.
-        //
-        // When dst_rank == src_rank, use the same connection lock for both ops
-        // to avoid deadlock (lock ordering).
+        // Chunked sendrecv handles CQ polling internally with PIPELINE=2.
+        // For same-peer case, use the single connection's chunked_sendrecv directly.
+        // For different peers, send and recv happen on separate connections,
+        // so use chunked_send + chunked_recv independently.
         if dst_rank == src_rank {
             let conn = self.conn(dst_rank as usize);
-            let recv_wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
-            let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
 
-            // Post recv FIRST using pre-registered buffer (UC mode)
-            global_counters().record_rdma_transfer(recv_len as u64);
-            conn.recv_buffered(recv_len, recv_wr_id).map_err(|e| {
-                self.metrics.record_recv_error();
-                rdma_to_distributed_enhanced(e, recv_wr_id)
-            })?;
-
-            // Post send using pre-registered buffer
             global_counters().record_rdma_transfer(send_data.len() as u64);
-            conn.send_buffered(send_data, send_wr_id).map_err(|e| {
+            global_counters().record_rdma_transfer(recv_len as u64);
+            let recv_buf = conn.chunked_sendrecv(send_data, recv_len).map_err(|e| {
                 self.metrics.record_send_error();
-                rdma_to_distributed_enhanced(e, send_wr_id)
+                rdma_to_distributed(e)
             })?;
-
-            conn.wait_completions(&[send_wr_id, recv_wr_id]).map_err(|e| {
-                rdma_to_distributed_enhanced(e, send_wr_id)
-            })?;
-
-            let recv_buf = conn.read_recv_buf(recv_len);
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);
@@ -1036,31 +999,28 @@ impl RdmaTransport for RdmaConnectionTransport {
                 (&*second_conn, &*first_conn)
             };
 
-            let recv_wr_id = self.next_wr_id(src_rank, ExchangeTag::Data, 0);
-            let send_wr_id = self.next_wr_id(dst_rank, ExchangeTag::Data, 0);
-
-            // Post recv FIRST on src connection using pre-registered buffer
+            // Post recv FIRST on src connection (UC mode: recv before send)
+            // Then send on dst connection. Both use chunked pipelining internally.
+            // Note: for different-peer sendrecv, we run chunked_recv and chunked_send
+            // on separate connections. We need recv posted before remote send arrives.
+            // Since chunked_recv posts recvs and polls, and chunked_send posts sends
+            // and polls, we need to interleave them. Use chunked_sendrecv on src_conn
+            // for recv-only (empty send) and dst_conn for send-only (zero recv).
             global_counters().record_rdma_transfer(recv_len as u64);
-            src_conn.recv_buffered(recv_len, recv_wr_id).map_err(|e| {
-                self.metrics.record_recv_error();
-                rdma_to_distributed_enhanced(e, recv_wr_id)
-            })?;
-
-            // Post send on dst connection using pre-registered buffer
             global_counters().record_rdma_transfer(send_data.len() as u64);
-            dst_conn.send_buffered(send_data, send_wr_id).map_err(|e| {
+
+            // Post recv on src connection first, then send on dst connection.
+            // chunked_sendrecv with empty send_data acts as recv-only.
+            // chunked_send handles send with internal CQ polling.
+            let recv_buf = src_conn.chunked_recv(recv_len).map_err(|e| {
+                self.metrics.record_recv_error();
+                rdma_to_distributed(e)
+            })?;
+
+            dst_conn.chunked_send(send_data).map_err(|e| {
                 self.metrics.record_send_error();
-                rdma_to_distributed_enhanced(e, send_wr_id)
+                rdma_to_distributed(e)
             })?;
-
-            dst_conn.wait_completions(&[send_wr_id]).map_err(|e| {
-                rdma_to_distributed_enhanced(e, send_wr_id)
-            })?;
-            src_conn.wait_completions(&[recv_wr_id]).map_err(|e| {
-                rdma_to_distributed_enhanced(e, recv_wr_id)
-            })?;
-
-            let recv_buf = src_conn.read_recv_buf(recv_len);
 
             self.metrics.record_send(send_data.len() as u64);
             self.metrics.record_recv(recv_len as u64);

@@ -403,8 +403,7 @@ impl RdmaDeviceProbe {
             }
             let raw = unsafe { gid.raw };
             // Check IPv4-mapped format: ::ffff:x.x.x.x
-            let is_ipv4_mapped =
-                raw[..10] == [0u8; 10] && raw[10] == 0xff && raw[11] == 0xff;
+            let is_ipv4_mapped = raw[..10] == [0u8; 10] && raw[10] == 0xff && raw[11] == 0xff;
             if !is_ipv4_mapped {
                 continue;
             }
@@ -476,10 +475,7 @@ fn find_device_index_by_cli(name: &str) -> Result<usize, RdmaError> {
     let mut index = 0usize;
     for line in stdout.lines() {
         let trimmed = line.trim();
-        if trimmed.starts_with("device")
-            || trimmed.starts_with("------")
-            || trimmed.is_empty()
-        {
+        if trimmed.starts_with("device") || trimmed.starts_with("------") || trimmed.is_empty() {
             continue;
         }
         let dev_name = trimmed.split_whitespace().next().unwrap_or("");

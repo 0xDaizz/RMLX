@@ -142,5 +142,9 @@ unsafe impl Send for MemoryRegion {}
 
 fn page_size() -> usize {
     let ps = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-    if ps > 0 { ps as usize } else { 16384 }
+    if ps > 0 {
+        ps as usize
+    } else {
+        16384
+    }
 }

@@ -10,9 +10,7 @@ use std::mem::MaybeUninit;
 use std::net::{TcpListener, TcpStream};
 use std::time::Instant;
 
-use rmlx_rdma::ffi::{
-    self, IbvRecvWr, IbvSendWr, IbvSge, IbvWc,
-};
+use rmlx_rdma::ffi::{self, IbvRecvWr, IbvSendWr, IbvSge, IbvWc};
 use rmlx_rdma::{CompletionQueue, MemoryRegion, QpInfo, QueuePair, RdmaContext};
 
 const BUF_SIZE: usize = 4096;
@@ -82,24 +80,32 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
     send_buf.iter_mut().for_each(|b| *b = fill_byte);
 
     let send_mr = unsafe {
-        MemoryRegion::register(&pd, send_buf.as_mut_ptr() as *mut std::ffi::c_void, BUF_SIZE)
+        MemoryRegion::register(
+            &pd,
+            send_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            BUF_SIZE,
+        )
     }
     .expect("failed to register send MR");
 
     let mut recv_buf = vec![0u8; BUF_SIZE];
     let recv_mr = unsafe {
-        MemoryRegion::register(&pd, recv_buf.as_mut_ptr() as *mut std::ffi::c_void, BUF_SIZE)
+        MemoryRegion::register(
+            &pd,
+            recv_buf.as_mut_ptr() as *mut std::ffi::c_void,
+            BUF_SIZE,
+        )
     }
     .expect("failed to register recv MR");
 
     eprintln!(
         "[rank {rank}] round {round}: send MR (lkey={}), recv MR (lkey={})",
-        send_mr.lkey(), recv_mr.lkey()
+        send_mr.lkey(),
+        recv_mr.lkey()
     );
 
     // Step 5: Connect QP (RESET -> INIT -> RTR -> RTS)
-    qp.connect(&remote_info)
-        .expect("failed to connect QP");
+    qp.connect(&remote_info).expect("failed to connect QP");
     eprintln!("[rank {rank}] round {round}: QP connected (RESET->INIT->RTR->RTS)");
 
     // Step 6: Bidirectional sendrecv
@@ -115,8 +121,7 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
         sg_list: &mut recv_sge,
         num_sge: 1,
     };
-    qp.post_recv(&mut recv_wr)
-        .expect("failed to post recv");
+    qp.post_recv(&mut recv_wr).expect("failed to post recv");
     eprintln!("[rank {rank}] round {round}: recv posted");
 
     // 6b: TCP barrier (ensure both sides have posted recv before sending)
@@ -145,8 +150,7 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
     send_wr.wr.remote_addr = 0;
     send_wr.wr.rkey = 0;
 
-    qp.post_send(&mut send_wr)
-        .expect("failed to post send");
+    qp.post_send(&mut send_wr).expect("failed to post send");
     eprintln!("[rank {rank}] round {round}: send posted");
 
     // 6d: Poll CQ for both send and recv completions (expect 2)
@@ -183,9 +187,7 @@ fn run_round(ctx: &RdmaContext, rank: u32, peer_ip: &str, round: u32) {
     }
 
     let elapsed = start.elapsed();
-    eprintln!(
-        "[rank {rank}] round {round}: SUCCESS — 2 completions in {elapsed:?}"
-    );
+    eprintln!("[rank {rank}] round {round}: SUCCESS — 2 completions in {elapsed:?}");
 
     // Step 7: Verify received data
     let expected_byte: u8 = if rank == 0 { 0xBB } else { 0xAA };
@@ -222,8 +224,8 @@ fn tcp_exchange_qp_info(rank: u32, peer_ip: &str, local: &QpInfo, port: u16) -> 
 
     if rank == 0 {
         // Listen and accept
-        let listener = TcpListener::bind(format!("0.0.0.0:{port}"))
-            .expect("failed to bind TCP listener");
+        let listener =
+            TcpListener::bind(format!("0.0.0.0:{port}")).expect("failed to bind TCP listener");
         eprintln!("[rank 0] TCP listening on port {port}...");
         let (mut stream, addr) = listener.accept().expect("failed to accept");
         eprintln!("[rank 0] TCP accepted from {addr}");
@@ -262,7 +264,6 @@ fn tcp_exchange_qp_info(rank: u32, peer_ip: &str, local: &QpInfo, port: u16) -> 
 
 /// Simple 1-byte TCP barrier between both ranks.
 fn tcp_barrier(rank: u32, peer_ip: &str, barrier_port: u16) {
-
     if rank == 0 {
         let listener = TcpListener::bind(format!("0.0.0.0:{barrier_port}"))
             .expect("failed to bind barrier listener");

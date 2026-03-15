@@ -31,8 +31,8 @@ pub use collectives::{
 };
 pub mod crc;
 pub use connection::{
-    CompletionTracker, PostedOp, PostedOpKind, RdmaConfig, RdmaConnection, RegisteredRecv,
-    RegisteredSend, SharedRdmaBuffer,
+    CompletionTracker, PostedOp, PostedOpKind, RdmaBufferPool, RdmaConfig, RdmaConnection,
+    RegisteredRecv, RegisteredSend, SharedRdmaBuffer,
 };
 #[allow(deprecated)]
 pub use connection_manager::ConnectionManager;
