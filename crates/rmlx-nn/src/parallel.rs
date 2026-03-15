@@ -495,7 +495,7 @@ impl ColumnParallelLinear {
         // Interleave rank-major gathered data directly into a Metal buffer,
         // skipping the intermediate Vec<u8> allocation.
         let result = interleave_gathered_into_array(
-            &*input.metal_buffer().device(),
+            &input.metal_buffer().device(),
             &gathered,
             batch,
             shard_out,
@@ -778,7 +778,7 @@ impl QuantizedColumnParallelLinear {
         // Interleave rank-major gathered data directly into a Metal buffer,
         // skipping the intermediate Vec<u8> allocation.
         let result = interleave_gathered_into_array(
-            &*x.metal_buffer().device(),
+            &x.metal_buffer().device(),
             &gathered,
             batch,
             shard_out,

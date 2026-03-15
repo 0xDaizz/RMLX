@@ -741,6 +741,7 @@ fn bench_parallel_linear(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "distributed")]
+#[allow(clippy::too_many_arguments)]
 fn bench_tp_forward_with_group(
     block: &TransformerBlock,
     input: &Array,
@@ -785,6 +786,7 @@ fn bench_tp_forward_with_group(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "distributed")]
+#[allow(clippy::too_many_arguments)]
 fn bench_tp_forward_split_cb(
     block: &TransformerBlock,
     input: &Array,

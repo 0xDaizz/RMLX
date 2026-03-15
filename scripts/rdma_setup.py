@@ -9,21 +9,21 @@ and verifies RDMA connectivity between nodes via SSH.
 Usage:
     # Basic two-node setup
     python scripts/rdma_setup.py \\
-      --node hwstudio1:en5:10.254.0.5 \\
-      --node hwstudio2:en5:10.254.0.6 \\
+      --node node0:en5:10.0.0.1 \\
+      --node node1:en5:10.0.0.2 \\
       --netmask 30
 
-    # With SSH proxy (hwstudio2 reached via hwstudio1)
+    # With SSH proxy (node1 reached via node0)
     python scripts/rdma_setup.py \\
-      --node hwstudio1:en5:10.254.0.5 \\
-      --node hwstudio2:en5:10.254.0.6 \\
+      --node node0:en5:10.0.0.1 \\
+      --node node1:en5:10.0.0.2 \\
       --netmask 30 \\
-      --proxy hwstudio1:hwstudio2
+      --proxy node0:node1
 
     # Dry-run mode (print commands without executing)
     python scripts/rdma_setup.py \\
-      --node hwstudio1:en5:10.254.0.5 \\
-      --node hwstudio2:en5:10.254.0.6 \\
+      --node node0:en5:10.0.0.1 \\
+      --node node1:en5:10.0.0.2 \\
       --netmask 30 \\
       --dry-run
 """
@@ -481,9 +481,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
-  %(prog)s --node hwstudio1:en5:10.254.0.5 --node hwstudio2:en5:10.254.0.6
-  %(prog)s --node hwstudio1:en5:10.254.0.5 --node hwstudio2:en5:10.254.0.6 --proxy hwstudio1:hwstudio2
-  %(prog)s --node hwstudio1:en5:10.254.0.5 --node hwstudio2:en5:10.254.0.6 --dry-run
+  %(prog)s --node node0:en5:10.0.0.1 --node node1:en5:10.0.0.2
+  %(prog)s --node node0:en5:10.0.0.1 --node node1:en5:10.0.0.2 --proxy node0:node1
+  %(prog)s --node node0:en5:10.0.0.1 --node node1:en5:10.0.0.2 --dry-run
 """,
     )
     parser.add_argument(

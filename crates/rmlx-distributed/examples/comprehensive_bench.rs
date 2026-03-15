@@ -400,7 +400,7 @@ fn main() {
         .expect("RMLX_RANK required")
         .parse()
         .expect("invalid RMLX_RANK");
-    let peer_host = std::env::var("RMLX_PEER_HOST").unwrap_or_else(|_| "10.254.0.5".into());
+    let peer_host = std::env::var("RMLX_PEER_HOST").unwrap_or_else(|_| "10.0.0.1".into());
     let port: u16 = std::env::var("RMLX_TEST_PORT")
         .unwrap_or_else(|_| "18515".into())
         .parse()

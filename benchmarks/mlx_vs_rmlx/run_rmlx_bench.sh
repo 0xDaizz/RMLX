@@ -1,21 +1,64 @@
 #!/usr/bin/env bash
 # RMLX comprehensive RDMA benchmark — 2-node launcher.
-#
-# Usage:
-#   ./run_rmlx_bench.sh [--skip-build]
-#
-# Uses establish() pattern (same as test suite).
-# Both nodes must have code synced and built.
-
+# Builds the comprehensive_bench binary on both nodes, then runs a 2-node
+# RDMA benchmark using the establish() pattern (same as test suite).
 set -euo pipefail
 
-NODE1="hwStudio1"
-NODE2="hwStudio2"
-NODE1_IP="10.254.0.5"
-NODE2_IP="10.254.0.6"
+# ─── Usage ─────────────────────────────────────────────────────────────
+usage() {
+    cat <<USAGE
+Usage: $(basename "$0") [OPTIONS]
+
+RMLX comprehensive RDMA benchmark — 2-node launcher. Builds the benchmark
+binary on both nodes, then runs a 2-node RDMA benchmark.
+
+Options:
+    --node0 HOST       SSH hostname for rank 0 (default: \$RMLX_NODE0 or node0)
+    --node1 HOST       SSH hostname for rank 1 (default: \$RMLX_NODE1 or node1)
+    --node0-ip IP      RDMA IP for rank 0 (default: \$RMLX_NODE0_IP or 10.0.0.1)
+    --node1-ip IP      RDMA IP for rank 1 (default: \$RMLX_NODE1_IP or 10.0.0.2)
+    --remote-dir DIR   Remote project directory (default: \$RMLX_REMOTE_DIR or \$HOME/rmlx)
+    --skip-build       Skip cargo build step
+    --help, -h         Show this help message
+
+Environment variables (override defaults, overridden by CLI args):
+    RMLX_NODE0, RMLX_NODE1, RMLX_NODE0_IP, RMLX_NODE1_IP, RMLX_REMOTE_DIR
+USAGE
+    exit 0
+}
+
+# ─── Parse args ────────────────────────────────────────────────────────
+# Priority: CLI args > env vars > defaults
+_NODE0=""
+_NODE1=""
+_NODE0_IP=""
+_NODE1_IP=""
+_REMOTE_DIR=""
+SKIP_BUILD=false
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --node0)      _NODE0="$2"; shift 2 ;;
+        --node1)      _NODE1="$2"; shift 2 ;;
+        --node0-ip)   _NODE0_IP="$2"; shift 2 ;;
+        --node1-ip)   _NODE1_IP="$2"; shift 2 ;;
+        --remote-dir) _REMOTE_DIR="$2"; shift 2 ;;
+        --skip-build) SKIP_BUILD=true; shift ;;
+        --help|-h)    usage ;;
+        *) echo "Unknown argument: $1"; usage ;;
+    esac
+done
+
+# Apply priority: CLI > env > default
+NODE1="${_NODE0:-${RMLX_NODE0:-node0}}"
+NODE2="${_NODE1:-${RMLX_NODE1:-node1}}"
+NODE1_IP="${_NODE0_IP:-${RMLX_NODE0_IP:-10.0.0.1}}"
+NODE2_IP="${_NODE1_IP:-${RMLX_NODE1_IP:-10.0.0.2}}"
+RMLX_ROOT="${_REMOTE_DIR:-${RMLX_REMOTE_DIR:-\$HOME/rmlx}}"
+
+# ─── Constants ─────────────────────────────────────────────────────────
 RDMA_DEVICE="rdma_en5"
 PORT="${RMLX_TEST_PORT:-30100}"
-RMLX_ROOT="/Users/hw/rmlx"
 BIN="target/release/examples/comprehensive_bench"
 TIMEOUT=180
 
@@ -26,7 +69,7 @@ echo "  Port: $PORT"
 echo ""
 
 # Build (unless --skip-build)
-if [[ "${1:-}" != "--skip-build" ]]; then
+if ! $SKIP_BUILD; then
     echo "[1/3] Building (release)..."
     ssh "$NODE1" "env -C $RMLX_ROOT cargo build --release --example comprehensive_bench -p rmlx-distributed 2>&1" | tail -1
     ssh "$NODE2" "env -C $RMLX_ROOT cargo build --release --example comprehensive_bench -p rmlx-distributed 2>&1" | tail -1

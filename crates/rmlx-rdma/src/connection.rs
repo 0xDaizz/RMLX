@@ -978,6 +978,7 @@ impl RdmaConnection {
                         data.len(),
                     )?
                 };
+                #[allow(clippy::arc_with_non_send_sync)]
                 let new_mr = Arc::new(new_mr);
                 self.mr_cache.lock().insert(key, Arc::clone(&new_mr));
                 new_mr

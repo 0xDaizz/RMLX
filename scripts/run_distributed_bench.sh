@@ -1,51 +1,76 @@
 #!/usr/bin/env bash
-# run_distributed_bench.sh — Launch distributed TP/EP benchmark on two Mac Studios
-#
-# Usage:
-#   ./scripts/run_distributed_bench.sh              # full run (sync + build + bench)
-#   ./scripts/run_distributed_bench.sh --local-only  # single-node baseline only
-#   ./scripts/run_distributed_bench.sh --ep          # EP benchmark instead of TP
-#
-# Environment:
-#   RMLX_NODE0/RMLX_NODE1: SSH hostnames (default: node0/node1)
-#   RMLX_NODE0_IP/RMLX_NODE1_IP: Coordinator IPs for RDMA (default: 10.0.0.1/10.0.0.2)
-#   RMLX_REMOTE_DIR: Remote project directory (default: /Users/hw/rmlx)
-#   RMLX_COORDINATOR_PORT: TCP port for QP exchange (default: 18520)
-#   TB5 RDMA: en5, GID_INDEX=1, IB_PORT=1, IBV_QPT_UC
-
+# run_distributed_bench.sh — Launch distributed TP/EP benchmark on two nodes.
+# Syncs code, builds on both machines, runs single-node baseline then 2-node benchmark.
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# ─── Usage ─────────────────────────────────────────────────────────────
+usage() {
+    cat <<USAGE
+Usage: $(basename "$0") [OPTIONS]
 
-# ─── Configuration ──────────────────────────────────────────────────────────
-# Override via environment variables or defaults
-NODE0="${RMLX_NODE0:-node0}"
-NODE1="${RMLX_NODE1:-node1}"
-NODE0_IP="${RMLX_NODE0_IP:-10.0.0.1}"
-NODE1_IP="${RMLX_NODE1_IP:-10.0.0.2}"
-COORDINATOR_PORT="${RMLX_COORDINATOR_PORT:-18520}"
+Launch distributed TP/EP benchmark on two nodes. Syncs code, builds on
+both machines, runs single-node baseline then 2-node distributed benchmark.
 
-REMOTE_DIR="${RMLX_REMOTE_DIR:-/Users/hw/rmlx}"
-BENCH_NAME="distributed_bench"
-RESULTS_DIR="$PROJECT_DIR/bench_results"
+Options:
+    --node0 HOST       SSH hostname for rank 0 (default: \$RMLX_NODE0 or node0)
+    --node1 HOST       SSH hostname for rank 1 (default: \$RMLX_NODE1 or node1)
+    --node0-ip IP      RDMA IP for rank 0 (default: \$RMLX_NODE0_IP or 10.0.0.1)
+    --node1-ip IP      RDMA IP for rank 1 (default: \$RMLX_NODE1_IP or 10.0.0.2)
+    --remote-dir DIR   Remote project directory (default: \$RMLX_REMOTE_DIR or \$HOME/rmlx)
+    --local-only       Single-node baseline only (no SSH needed)
+    --ep               EP benchmark instead of TP
+    --help, -h         Show this help message
 
-# ─── Parse args ─────────────────────────────────────────────────────────────
+Environment variables (override defaults, overridden by CLI args):
+    RMLX_NODE0, RMLX_NODE1, RMLX_NODE0_IP, RMLX_NODE1_IP, RMLX_REMOTE_DIR
+    RMLX_COORDINATOR_PORT (default: 18520)
+USAGE
+    exit 0
+}
+
+# ─── Parse args ────────────────────────────────────────────────────────
+# Priority: CLI args > env vars > defaults
+_NODE0=""
+_NODE1=""
+_NODE0_IP=""
+_NODE1_IP=""
+_REMOTE_DIR=""
 LOCAL_ONLY=false
 RUN_EP=false
-for arg in "$@"; do
-    case "$arg" in
-        --local-only) LOCAL_ONLY=true ;;
-        --ep) RUN_EP=true ;;
-        *) echo "Unknown argument: $arg"; exit 1 ;;
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --node0)      _NODE0="$2"; shift 2 ;;
+        --node1)      _NODE1="$2"; shift 2 ;;
+        --node0-ip)   _NODE0_IP="$2"; shift 2 ;;
+        --node1-ip)   _NODE1_IP="$2"; shift 2 ;;
+        --remote-dir) _REMOTE_DIR="$2"; shift 2 ;;
+        --local-only) LOCAL_ONLY=true; shift ;;
+        --ep)         RUN_EP=true; shift ;;
+        --help|-h)    usage ;;
+        *) echo "Unknown argument: $1"; usage ;;
     esac
 done
+
+# Apply priority: CLI > env > default
+NODE0="${_NODE0:-${RMLX_NODE0:-node0}}"
+NODE1="${_NODE1:-${RMLX_NODE1:-node1}}"
+NODE0_IP="${_NODE0_IP:-${RMLX_NODE0_IP:-10.0.0.1}}"
+NODE1_IP="${_NODE1_IP:-${RMLX_NODE1_IP:-10.0.0.2}}"
+REMOTE_DIR="${_REMOTE_DIR:-${RMLX_REMOTE_DIR:-\$HOME/rmlx}}"
+
+# ─── Configuration ──────────────────────────────────────────────────────────
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+COORDINATOR_PORT="${RMLX_COORDINATOR_PORT:-18520}"
+BENCH_NAME="distributed_bench"
+RESULTS_DIR="$PROJECT_DIR/bench_results"
 
 if [ "$RUN_EP" = true ]; then
     BENCH_NAME="ep_bench"
 fi
 
-# ─── Helpers ────────────────────────────────────────────────────────────────
+# ─── Helpers ────────────────────────────────────────────────────────────
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
 ssh_cmd() {

@@ -1361,13 +1361,13 @@ mod tests {
             port_num: 1,
             gid_index: 1,
             interface: "en5".to_string(),
-            address: "10.254.0.5".to_string(),
+            address: std::env::var("RMLX_NODE0_IP").unwrap_or_else(|_| "10.0.0.1".into()),
         };
         let secondary = PortConfig {
             port_num: 2,
             gid_index: 1,
             interface: "en6".to_string(),
-            address: "10.254.0.6".to_string(),
+            address: std::env::var("RMLX_NODE1_IP").unwrap_or_else(|_| "10.0.0.2".into()),
         };
         let config = DualPortConfig::dual(primary, secondary, 4);
         let engine = StripeEngine::new(config);
