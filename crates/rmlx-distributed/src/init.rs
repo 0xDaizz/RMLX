@@ -24,6 +24,7 @@ use rmlx_rdma::context::RdmaContext;
 use rmlx_rdma::coordinator::CoordinatorConfig;
 use rmlx_rdma::device_file::DeviceMap;
 use rmlx_rdma::multi_port::Topology;
+use rmlx_rdma::progress::ProgressEngine;
 use rmlx_rdma::qp::{CompletionQueue, QpInfo, QueuePair};
 
 use crate::group::{DistributedError, Group};
@@ -513,6 +514,8 @@ fn try_rdma_init(
 
     // connections[rank] is None (self-slot); all others are Some.
     let transport = RdmaConnectionTransport::new(connections, rank);
+    // Auto-attach progress engine so async (non-blocking) send/recv works by default.
+    let transport = transport.with_progress_engine(Arc::new(ProgressEngine::new()));
     let all_ranks: Vec<u32> = (0..world_size).collect();
     let group = Group::with_transport(all_ranks, rank, world_size, Arc::new(transport))?;
 

@@ -72,7 +72,7 @@ pub struct RowParallelLinear {
 /// Read f32 values from a potentially non-contiguous 2D Array, respecting strides.
 ///
 /// Returns a contiguous Vec<f32> of shape [rows, cols] in row-major order.
-#[cfg(feature = "distributed")]
+#[cfg(test)]
 fn read_f32_strided(arr: &Array) -> Vec<f32> {
     assert_eq!(arr.dtype(), DType::Float32);
     assert_eq!(arr.ndim(), 2);
@@ -102,7 +102,7 @@ fn read_f32_strided(arr: &Array) -> Vec<f32> {
 ///
 /// a: [m, k] row-major, b: [n, k] row-major (transposed for output [m, n]).
 /// Returns [m, n] contiguous row-major.
-#[cfg(feature = "distributed")]
+#[cfg(test)]
 fn cpu_matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
     let mut out = vec![0.0f32; m * n];
     for i in 0..m {
@@ -153,6 +153,52 @@ fn array_from_raw_bytes(
         strides[i] = strides[i + 1] * shape[i + 1];
     }
     Array::new(buffer, shape, strides, dtype, 0)
+}
+
+/// Interleave rank-major gathered bytes directly into a Metal buffer, returning
+/// an Array in batch-major layout — eliminates the intermediate `Vec<u8>`
+/// allocation that `array_from_raw_bytes` would require.
+///
+/// `gathered` layout: `[rank0_all_rows | rank1_all_rows | ...]`  (rank-major)
+/// Output layout:     `[row0_shard0 ++ row0_shard1 ++ ... | row1_... ]` (batch-major)
+#[cfg(feature = "distributed")]
+fn interleave_gathered_into_array(
+    device: &ProtocolObject<dyn MTLDevice>,
+    gathered: &[u8],
+    batch: usize,
+    shard_out: usize,
+    full_out: usize,
+    world: usize,
+    dtype: DType,
+) -> Array {
+    let elem_bytes = dtype.size_of();
+    let shard_bytes = shard_out * elem_bytes;
+    let row_bytes = full_out * elem_bytes;
+    let output_size = batch * row_bytes;
+
+    // Allocate Metal buffer directly (no intermediate Vec)
+    let buffer = device
+        .newBufferWithLength_options(output_size, MTLResourceOptions::StorageModeShared)
+        .unwrap();
+    let dst_base = buffer.contents().as_ptr() as *mut u8;
+
+    // Copy gathered data in batch-major order directly into Metal buffer
+    for r in 0..batch {
+        for rank in 0..world {
+            let src_offset = rank * batch * shard_bytes + r * shard_bytes;
+            let dst_offset = r * row_bytes + rank * shard_bytes;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    gathered.as_ptr().add(src_offset),
+                    dst_base.add(dst_offset),
+                    shard_bytes,
+                );
+            }
+        }
+    }
+
+    let strides = vec![full_out, 1];
+    Array::new(buffer, vec![batch, full_out], strides, dtype, 0)
 }
 
 /// Element-wise addition: a[i] += b[i] for raw byte slices interpreted as f32.
@@ -402,7 +448,6 @@ impl ColumnParallelLinear {
             "weight dtype must match input dtype"
         );
 
-        let elem_bytes = dtype.size_of();
         let batch = input.shape()[0];
         let k = input.shape()[1]; // in_features
         assert_eq!(k, self.in_features, "input in_features mismatch");
@@ -445,24 +490,16 @@ impl ColumnParallelLinear {
         );
 
         let world = self.world_size as usize;
-        let shard_bytes = shard_out * elem_bytes; // bytes per rank per row
-        let row_bytes = self.out_features * elem_bytes; // bytes per output row
 
-        let mut interleaved = vec![0u8; batch * row_bytes];
-        for r in 0..batch {
-            for rank in 0..world {
-                let src_offset = rank * batch * shard_bytes + r * shard_bytes;
-                let dst_offset = r * row_bytes + rank * shard_bytes;
-                interleaved[dst_offset..dst_offset + shard_bytes]
-                    .copy_from_slice(&gathered[src_offset..src_offset + shard_bytes]);
-            }
-        }
-
-        // Reconstruct Array from interleaved bytes
-        let result = array_from_raw_bytes(
+        // Interleave rank-major gathered data directly into a Metal buffer,
+        // skipping the intermediate Vec<u8> allocation.
+        let result = interleave_gathered_into_array(
             &*input.metal_buffer().device(),
-            &interleaved,
-            vec![batch, self.out_features],
+            &gathered,
+            batch,
+            shard_out,
+            self.out_features,
+            world,
             dtype,
         );
         Ok(result)
@@ -729,30 +766,20 @@ impl QuantizedColumnParallelLinear {
             .map_err(|e| TpError(format!("allgather failed: {e}")))?;
 
         let dtype = local_out.dtype();
-        let elem_bytes = dtype.size_of();
         let batch = local_out.shape()[0];
         let shard_out = self.ql.out_features();
         let full_out = shard_out * self.world_size as usize;
         let world = self.world_size as usize;
 
-        // Interleave: gathered is rank-major [rank0_all_rows][rank1_all_rows]...
-        // We need batch-major: [row0_rank0_shard ++ row0_rank1_shard ++ ...]
-        let shard_bytes = shard_out * elem_bytes;
-        let row_bytes = full_out * elem_bytes;
-        let mut interleaved = vec![0u8; batch * row_bytes];
-        for r in 0..batch {
-            for rank in 0..world {
-                let src_offset = rank * batch * shard_bytes + r * shard_bytes;
-                let dst_offset = r * row_bytes + rank * shard_bytes;
-                interleaved[dst_offset..dst_offset + shard_bytes]
-                    .copy_from_slice(&gathered[src_offset..src_offset + shard_bytes]);
-            }
-        }
-
-        let result = array_from_raw_bytes(
+        // Interleave rank-major gathered data directly into a Metal buffer,
+        // skipping the intermediate Vec<u8> allocation.
+        let result = interleave_gathered_into_array(
             &*x.metal_buffer().device(),
-            &interleaved,
-            vec![batch, full_out],
+            &gathered,
+            batch,
+            shard_out,
+            full_out,
+            world,
             dtype,
         );
         Ok(result)

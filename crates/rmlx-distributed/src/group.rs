@@ -1841,6 +1841,20 @@ pub enum AllreduceAlgorithm {
 }
 
 // ─── Topology-aware ring ordering ───
+//
+// NOTE: TopologyRing is currently **not connected** to any collective algorithm.
+// Ring collectives (ring_allreduce, ring_allreduce_op, ring_allreduce_op_native)
+// use `&self.ranks` directly, which is sorted numerically — not by network proximity.
+//
+// Future integration path:
+//   1. In `Group::allreduce_op()` (and similar), call `TopologyRing::from_env(&self.ranks)`
+//      to obtain a topology-ordered rank slice.
+//   2. Pass the reordered slice to `ring_allreduce_op()` instead of `&self.ranks`.
+//   3. This requires no algorithm changes — the ring collectives already use the
+//      `ranks` parameter to derive left/right neighbors, so reordering the input
+//      is sufficient to make them topology-aware.
+//
+// Blocked on: real multi-hop topology (current 2-node setup has no hop variance).
 
 /// Topology-aware ring that reorders ranks based on inter-node hop counts.
 ///
