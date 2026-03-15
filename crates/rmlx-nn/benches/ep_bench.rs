@@ -1,27 +1,34 @@
-//! ⚠️ NON-PRODUCTION PATH — expert parallelism component benchmark.
-//! Tests MoE layer components (router, expert FFN, all_to_all) individually, not
-//! full TransformerModel forward path.
-//! For production throughput, use e2e_prefill_bench (prefill) or pipeline_bench (decode).
+//! Expert Parallelism (EP) Benchmark — **production path** optimized.
 //!
-//! Expert Parallelism (EP) Benchmark
+//! Uses single-CB encoding throughout:
+//! - Single expert FFN: `forward_into_cb` + `fused_silu_mul_into_cb` in one command buffer
+//! - MoE grouped forward: `ExpertGroup::grouped_forward()` — single CB for all experts
+//! - EP-2 simulation: same grouped forward for local expert partition
 //!
-//! Measures MoE layer components at Mixtral 8x7B-like configuration:
-//! - 8 experts, hidden=4096, intermediate=14336, top_k=2
-//! - Router (gate) latency
-//! - Expert FFN: gate_up + SiLU + down per expert
-//! - Total MoE layer (PerExpert vs GatherMM strategies)
+//! Measures MoE layer components at Qwen 3.5 MoE A22B configuration:
+//! - 8 experts, hidden=3584, intermediate=18944, top_k=2
+//! - Router (gate) latency [requires CPU sync for topk]
+//! - Expert FFN: gate_up + SiLU + down per expert [single-CB]
+//! - Total MoE layer (Grouped vs GatherMM strategies)
 //! - EP-2 simulation: 4 experts per rank (half experts, half compute)
 //! - Real RDMA token exchange: actual 2-node all_to_all over TB5
 //!
 //! Token counts per expert: M = [1, 4, 8, 16, 32]
+//! MoE/EP benchmarks also run prefill sizes: M = [128, 512]
+//!
+//! Environment variables:
+//!   RMLX_BENCH_WARMUP  — warmup iterations (default: 5)
+//!   RMLX_BENCH_ITERS   — measurement iterations (default: 30)
 //!
 //! Run (single-node):
 //!   cargo bench -p rmlx-nn --bench ep_bench
 //! Run (2-node with RDMA):
 //!   cargo bench -p rmlx-nn --bench ep_bench --features distributed
+//! Run with custom iteration counts:
+//!   RMLX_BENCH_WARMUP=10 RMLX_BENCH_ITERS=50 cargo bench -p rmlx-nn --bench ep_bench
 
 use objc2::runtime::ProtocolObject;
-use objc2_metal::MTLDevice as _;
+use objc2_metal::{MTLCommandBuffer as _, MTLCommandQueue as _, MTLDevice as _};
 use std::time::{Duration, Instant};
 
 use rmlx_core::array::Array;
@@ -29,19 +36,21 @@ use rmlx_core::dtype::DType;
 use rmlx_core::kernels::KernelRegistry;
 use rmlx_core::ops;
 use rmlx_metal::device::GpuDevice;
-use rmlx_nn::{Expert, Linear, LinearConfig, MoeConfig, MoeLayer, MoeStrategy};
+use rmlx_nn::{Expert, ExpertGroup, Linear, LinearConfig, MoeConfig, MoeLayer, MoeStrategy};
 
-// ─── Mixtral 8x7B-like config ───
+// ─── Qwen 3.5 MoE A22B config ───
 const NUM_EXPERTS: usize = 8;
 const TOP_K: usize = 2;
-const HIDDEN_DIM: usize = 4096;
-const INTERMEDIATE_DIM: usize = 14336;
+const HIDDEN_DIM: usize = 3584;
+const INTERMEDIATE_DIM: usize = 18944;
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 30;
 
 // ─── Token counts to benchmark (tokens routed per expert) ───
 const M_VALUES: &[usize] = &[1, 4, 8, 16, 32];
+// Extended M values including prefill sizes for MoE/EP benchmarks (fair comparison with MLX EP bench)
+const M_VALUES_WITH_PREFILL: &[usize] = &[1, 4, 8, 16, 32, 128, 512];
 
 // ---------------------------------------------------------------------------
 // Stats helper (same as distributed_bench)
@@ -217,15 +226,15 @@ fn build_moe_layer(
 // Benchmark helpers
 // ---------------------------------------------------------------------------
 
-fn run_bench<F>(label: &str, mut f: F) -> Stats
+fn run_bench<F>(label: &str, warmup: usize, iters: usize, mut f: F) -> Stats
 where
     F: FnMut(),
 {
-    for _ in 0..WARMUP_ITERS {
+    for _ in 0..warmup {
         f();
     }
-    let mut latencies = Vec::with_capacity(BENCH_ITERS);
-    for _ in 0..BENCH_ITERS {
+    let mut latencies = Vec::with_capacity(iters);
+    for _ in 0..iters {
         let start = Instant::now();
         f();
         latencies.push(start.elapsed());
@@ -236,15 +245,17 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: Router (gate) latency
+// Benchmark: Router (gate) latency [requires CPU sync]
 // ---------------------------------------------------------------------------
 
 fn bench_router(
     device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    warmup: usize,
+    iters: usize,
 ) {
-    println!("\n=== Router (gate) latency ===");
+    println!("\n=== Router (gate) latency [requires CPU sync] ===");
 
     let gate = make_gate(device, HIDDEN_DIM, NUM_EXPERTS, 500);
 
@@ -252,7 +263,7 @@ fn bench_router(
         let seq_len = m * NUM_EXPERTS / TOP_K; // total tokens to produce m per expert on average
         let input = rand_array(device, &[seq_len, HIDDEN_DIM], 42 + m as u64);
         let label = format!("gate [{}x{}->{}] + topk", seq_len, HIDDEN_DIM, NUM_EXPERTS);
-        run_bench(&label, || {
+        run_bench(&label, warmup, iters, || {
             let gate_logits = gate.forward(&input, registry, queue).expect("gate forward");
             // topk_route requires f32 logits
             let gate_logits_f32 =
@@ -265,66 +276,105 @@ fn bench_router(
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: Single expert FFN (SwiGLU)
+// Benchmark: Single expert FFN [single-CB] (SwiGLU)
 // ---------------------------------------------------------------------------
 
 fn bench_single_expert_ffn(
     device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    warmup: usize,
+    iters: usize,
 ) {
-    println!("\n=== Single expert FFN (SwiGLU: gate*up -> silu -> down) ===");
+    println!("\n=== Single expert FFN [single-CB] (SwiGLU: gate*up -> silu -> down) ===");
 
-    let expert = make_expert(device, HIDDEN_DIM, INTERMEDIATE_DIM, 100);
+    let mut expert = make_expert(device, HIDDEN_DIM, INTERMEDIATE_DIM, 100);
+    expert
+        .gate_proj
+        .prepare_weight_t(registry, queue)
+        .expect("prepare gate_proj");
+    expert
+        .up_proj
+        .prepare_weight_t(registry, queue)
+        .expect("prepare up_proj");
+    expert
+        .down_proj
+        .prepare_weight_t(registry, queue)
+        .expect("prepare down_proj");
 
-    for &m in M_VALUES {
+    for &m in M_VALUES_WITH_PREFILL {
         let input = rand_array(device, &[m, HIDDEN_DIM], 42 + m as u64);
-        let label = format!("expert_ffn [M={}] 4096->14336->4096", m);
-        run_bench(&label, || {
-            let _ = expert.forward(&input, registry, queue).expect("expert fwd");
+        let label = format!("expert_ffn [M={}] 3584->18944->3584", m);
+        run_bench(&label, warmup, iters, || {
+            let cb = queue.commandBufferWithUnretainedReferences().unwrap();
+            let gate_out = expert
+                .gate_proj
+                .forward_into_cb(&input, registry, &cb)
+                .unwrap();
+            let up_out = expert
+                .up_proj
+                .forward_into_cb(&input, registry, &cb)
+                .unwrap();
+            let hidden =
+                ops::fused::fused_silu_mul_into_cb(registry, &gate_out, &up_out, &cb).unwrap();
+            let _ = expert
+                .down_proj
+                .forward_into_cb(&hidden, registry, &cb)
+                .unwrap();
+            cb.commit();
+            cb.waitUntilCompleted();
         });
     }
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: Sequential expert dispatch (PerExpert strategy)
+// Benchmark: MoE grouped forward [production path] (single-CB, all experts)
 // ---------------------------------------------------------------------------
 
 fn bench_moe_per_expert(
     device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    warmup: usize,
+    iters: usize,
 ) {
-    println!("\n=== MoE PerExpert strategy (sequential dispatch, 8 experts) ===");
+    println!("\n=== MoE grouped forward [production path] (single-CB, 8 experts) ===");
 
-    let moe = build_moe_layer(
-        device,
-        NUM_EXPERTS,
-        HIDDEN_DIM,
-        INTERMEDIATE_DIM,
-        MoeStrategy::PerExpert,
-    );
+    let experts: Vec<Expert> = (0..NUM_EXPERTS)
+        .map(|i| make_expert(device, HIDDEN_DIM, INTERMEDIATE_DIM, 2000 + i as u64 * 10))
+        .collect();
+    let expert_group =
+        ExpertGroup::from_experts(&experts, registry, queue).expect("ExpertGroup::from_experts");
 
-    for &m in M_VALUES {
+    for &m in M_VALUES_WITH_PREFILL {
         let seq_len = m * NUM_EXPERTS / TOP_K;
-        let input = rand_array(device, &[seq_len, HIDDEN_DIM], 42 + m as u64);
-        let label = format!("moe_per_expert [seq={}, ~{} tok/expert]", seq_len, m);
-        run_bench(&label, || {
-            let _ = moe.forward(&input, registry, queue).expect("moe fwd");
+        // Create per-expert input batches (simulating router dispatch)
+        let expert_inputs: Vec<Array> = (0..NUM_EXPERTS)
+            .map(|i| rand_array(device, &[m, HIDDEN_DIM], 42 + m as u64 + i as u64 * 100))
+            .collect();
+        let expert_input_refs: Vec<(usize, &Array)> = expert_inputs.iter().enumerate().collect();
+
+        let label = format!("moe_grouped [seq={}, ~{} tok/expert]", seq_len, m);
+        run_bench(&label, warmup, iters, || {
+            let _ = expert_group
+                .grouped_forward(&expert_input_refs, registry, queue)
+                .expect("grouped fwd");
         });
     }
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: GatherMM strategy (batched GEMM across experts)
+// Benchmark: GatherMM strategy [multi-CB] (batched GEMM across experts)
 // ---------------------------------------------------------------------------
 
 fn bench_moe_gather_mm(
     device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    warmup: usize,
+    iters: usize,
 ) {
-    println!("\n=== MoE GatherMM strategy (batched GEMM, 8 experts) ===");
+    println!("\n=== MoE GatherMM strategy [multi-CB] (batched GEMM, 8 experts) ===");
 
     let moe = build_moe_layer(
         device,
@@ -334,11 +384,11 @@ fn bench_moe_gather_mm(
         MoeStrategy::GatherMM,
     );
 
-    for &m in M_VALUES {
+    for &m in M_VALUES_WITH_PREFILL {
         let seq_len = m * NUM_EXPERTS / TOP_K;
         let input = rand_array(device, &[seq_len, HIDDEN_DIM], 42 + m as u64);
         let label = format!("moe_gather_mm  [seq={}, ~{} tok/expert]", seq_len, m);
-        run_bench(&label, || {
+        run_bench(&label, warmup, iters, || {
             let _ = moe.forward(&input, registry, queue).expect("moe fwd");
         });
     }
@@ -352,11 +402,13 @@ fn bench_gather_mm_raw(
     device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    warmup: usize,
+    iters: usize,
 ) {
     println!("\n=== Raw gather_mm kernel (no routing overhead) ===");
 
     // Stacked expert weights: [8, K, N]
-    // gate_proj: K=4096, N=14336
+    // gate_proj: K=3584, N=18944
     let gate_weights = rand_array(device, &[NUM_EXPERTS, HIDDEN_DIM, INTERMEDIATE_DIM], 800);
 
     for &m in M_VALUES {
@@ -367,8 +419,8 @@ fn bench_gather_mm_raw(
         let indices_data: Vec<u32> = (0..batch).map(|i| (i % NUM_EXPERTS) as u32).collect();
         let indices = Array::from_slice(device, &indices_data, vec![batch]);
 
-        let label = format!("gather_mm [batch={}, 4096->14336]", batch);
-        run_bench(&label, || {
+        let label = format!("gather_mm [batch={}, 3584->18944]", batch);
+        run_bench(&label, warmup, iters, || {
             let _ = ops::gather_mm::gather_mm(registry, &x, &gate_weights, &indices, queue)
                 .expect("gather_mm");
         });
@@ -376,40 +428,45 @@ fn bench_gather_mm_raw(
 }
 
 // ---------------------------------------------------------------------------
-// Benchmark: EP-2 simulation (4 experts per rank)
+// Benchmark: EP-2 simulation [production path] (4 experts per rank)
 // ---------------------------------------------------------------------------
 
 fn bench_ep2_simulation(
     device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    warmup: usize,
+    iters: usize,
 ) {
-    println!("\n=== EP-2 simulation: 4 experts per rank (half compute) ===");
+    println!("\n=== EP-2 simulation [production path]: 4 experts per rank (half compute) ===");
     println!("  Simulates rank 0 of EP=2: only experts 0..4 are local.");
-    println!("  Routing still runs over all 8 experts; non-local tokens are discarded.");
+    println!("  Uses ExpertGroup::grouped_forward() — single CB for all local experts.");
 
-    // Build MoE with only 4 experts (simulating local partition)
     let ep_experts = NUM_EXPERTS / 2; // 4 experts on this rank
-    let moe_ep = build_moe_layer(
-        device,
-        ep_experts,
-        HIDDEN_DIM,
-        INTERMEDIATE_DIM,
-        MoeStrategy::PerExpert,
-    );
 
-    for &m in M_VALUES {
-        // Total tokens: same as full MoE, but only half are routed locally
+    let experts: Vec<Expert> = (0..ep_experts)
+        .map(|i| make_expert(device, HIDDEN_DIM, INTERMEDIATE_DIM, 2000 + i as u64 * 10))
+        .collect();
+    let expert_group =
+        ExpertGroup::from_experts(&experts, registry, queue).expect("ExpertGroup::from_experts");
+
+    for &m in M_VALUES_WITH_PREFILL {
         let seq_len = m * ep_experts / TOP_K;
-        let input = rand_array(device, &[seq_len, HIDDEN_DIM], 42 + m as u64);
-        let label = format!("ep2_local_compute [seq={}, 4 experts]", seq_len);
-        run_bench(&label, || {
-            let _ = moe_ep.forward(&input, registry, queue).expect("ep2 fwd");
+        let expert_inputs: Vec<Array> = (0..ep_experts)
+            .map(|i| rand_array(device, &[m, HIDDEN_DIM], 42 + m as u64 + i as u64 * 100))
+            .collect();
+        let expert_input_refs: Vec<(usize, &Array)> = expert_inputs.iter().enumerate().collect();
+
+        let label = format!("ep2_grouped [seq={}, 4 experts]", seq_len);
+        run_bench(&label, warmup, iters, || {
+            let _ = expert_group
+                .grouped_forward(&expert_input_refs, registry, queue)
+                .expect("ep2 grouped fwd");
         });
     }
 
     // Also benchmark the GatherMM strategy for EP-2
-    println!("\n=== EP-2 simulation with GatherMM (4 experts per rank) ===");
+    println!("\n=== EP-2 simulation with GatherMM [multi-CB] (4 experts per rank) ===");
     let moe_ep_gmm = build_moe_layer(
         device,
         ep_experts,
@@ -418,11 +475,11 @@ fn bench_ep2_simulation(
         MoeStrategy::GatherMM,
     );
 
-    for &m in M_VALUES {
+    for &m in M_VALUES_WITH_PREFILL {
         let seq_len = m * ep_experts / TOP_K;
         let input = rand_array(device, &[seq_len, HIDDEN_DIM], 42 + m as u64);
         let label = format!("ep2_gather_mm  [seq={}, 4 experts]", seq_len);
-        run_bench(&label, || {
+        run_bench(&label, warmup, iters, || {
             let _ = moe_ep_gmm
                 .forward(&input, registry, queue)
                 .expect("ep2 gmm fwd");
@@ -440,6 +497,8 @@ fn bench_ep2_real_exchange(
     device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
     registry: &KernelRegistry,
     queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    warmup: usize,
+    iters: usize,
 ) {
     println!("\n=== EP-2 real RDMA token exchange (all_to_all) ===");
     println!(
@@ -464,36 +523,41 @@ fn bench_ep2_real_exchange(
             HIDDEN_DIM * 2,
             payload_bytes as f64 / 1024.0
         );
-        run_bench(&label, || {
+        run_bench(&label, warmup, iters, || {
             let _ = group.all_to_all(&data).expect("all_to_all");
         });
     }
 
     // EP-2 end-to-end: local compute + RDMA exchange
-    println!("\n=== EP-2 end-to-end: local compute + real RDMA token exchange ===");
+    println!(
+        "\n=== EP-2 end-to-end [production path]: local compute + real RDMA token exchange ==="
+    );
 
     let ep_experts = NUM_EXPERTS / 2;
-    let moe_ep = build_moe_layer(
-        device,
-        ep_experts,
-        HIDDEN_DIM,
-        INTERMEDIATE_DIM,
-        MoeStrategy::PerExpert,
-    );
+    let experts: Vec<Expert> = (0..ep_experts)
+        .map(|i| make_expert(device, HIDDEN_DIM, INTERMEDIATE_DIM, 2000 + i as u64 * 10))
+        .collect();
+    let expert_group =
+        ExpertGroup::from_experts(&experts, registry, queue).expect("ExpertGroup::from_experts");
 
     for &m in M_VALUES {
         let seq_len = m * ep_experts / TOP_K;
-        let input = rand_array(device, &[seq_len, HIDDEN_DIM], 42 + m as u64);
+        let expert_inputs: Vec<Array> = (0..ep_experts)
+            .map(|i| rand_array(device, &[m, HIDDEN_DIM], 42 + m as u64 + i as u64 * 100))
+            .collect();
+        let expert_input_refs: Vec<(usize, &Array)> = expert_inputs.iter().enumerate().collect();
         let payload_bytes = seq_len * HIDDEN_DIM * 2;
         let dispatch_data = vec![0u8; payload_bytes];
 
         let label = format!("ep2_e2e [seq={}, 4 local experts + RDMA]", seq_len);
-        run_bench(&label, || {
+        run_bench(&label, warmup, iters, || {
             // 1. Dispatch: exchange tokens between nodes
             let _ = group.all_to_all(&dispatch_data).expect("dispatch");
 
-            // 2. Local expert compute
-            let _ = moe_ep.forward(&input, registry, queue).expect("local fwd");
+            // 2. Local expert compute (single CB via grouped_forward)
+            let _ = expert_group
+                .grouped_forward(&expert_input_refs, registry, queue)
+                .expect("local grouped fwd");
 
             // 3. Combine: exchange results back
             let _ = group.all_to_all(&dispatch_data).expect("combine");
@@ -518,6 +582,16 @@ fn main() {
     let device = registry.device().raw();
     let queue = device.newCommandQueue().unwrap();
 
+    // ── Env var overrides ──
+    let warmup: usize = std::env::var("RMLX_BENCH_WARMUP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(WARMUP_ITERS);
+    let iters: usize = std::env::var("RMLX_BENCH_ITERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(BENCH_ITERS);
+
     // ── Distributed init ──
     #[cfg(feature = "distributed")]
     let dist_ctx = {
@@ -540,40 +614,44 @@ fn main() {
         }
     };
 
-    println!("\nConfig: Mixtral 8x7B-like MoE layer");
+    println!("\nConfig: Qwen 3.5 MoE A22B MoE layer");
     println!(
         "  experts={}, top_k={}, hidden={}, intermediate={}",
         NUM_EXPERTS, TOP_K, HIDDEN_DIM, INTERMEDIATE_DIM
     );
-    println!(
-        "  dtype: float16, warmup={}, bench_iters={}",
-        WARMUP_ITERS, BENCH_ITERS
-    );
+    println!("  dtype: float16, warmup={}, bench_iters={}", warmup, iters);
+    if warmup != WARMUP_ITERS || iters != BENCH_ITERS {
+        println!("  (overridden via RMLX_BENCH_WARMUP / RMLX_BENCH_ITERS)");
+    }
     println!("  M values (tokens per expert): {:?}", M_VALUES);
+    println!(
+        "  M values with prefill (MoE/EP):  {:?}",
+        M_VALUES_WITH_PREFILL
+    );
 
-    // ── 1. Router latency ──
-    bench_router(device, &registry, &queue);
+    // ── 1. Router latency [requires CPU sync] ──
+    bench_router(device, &registry, &queue, warmup, iters);
 
-    // ── 2. Single expert FFN ──
-    bench_single_expert_ffn(device, &registry, &queue);
+    // ── 2. Single expert FFN [single-CB] ──
+    bench_single_expert_ffn(device, &registry, &queue, warmup, iters);
 
-    // ── 3. Full MoE: PerExpert strategy ──
-    bench_moe_per_expert(device, &registry, &queue);
+    // ── 3. Full MoE: Grouped forward [production path] ──
+    bench_moe_per_expert(device, &registry, &queue, warmup, iters);
 
-    // ── 4. Full MoE: GatherMM strategy ──
-    bench_moe_gather_mm(device, &registry, &queue);
+    // ── 4. Full MoE: GatherMM strategy [multi-CB] ──
+    bench_moe_gather_mm(device, &registry, &queue, warmup, iters);
 
     // ── 5. Raw gather_mm kernel ──
-    bench_gather_mm_raw(device, &registry, &queue);
+    bench_gather_mm_raw(device, &registry, &queue, warmup, iters);
 
-    // ── 6. EP-2 simulation ──
-    bench_ep2_simulation(device, &registry, &queue);
+    // ── 6. EP-2 simulation [production path] ──
+    bench_ep2_simulation(device, &registry, &queue, warmup, iters);
 
     // ── 7. Real RDMA EP exchange (requires distributed + RDMA transport) ──
     #[cfg(feature = "distributed")]
     if let Some(ref ctx) = dist_ctx {
         if ctx.group.has_transport() && ctx.world_size > 1 {
-            bench_ep2_real_exchange(&ctx.group, device, &registry, &queue);
+            bench_ep2_real_exchange(&ctx.group, device, &registry, &queue, warmup, iters);
         }
     }
 
@@ -581,7 +659,8 @@ fn main() {
     println!("\n========================================================================");
     println!("SUMMARY");
     println!("========================================================================");
-    println!("  PerExpert: sequential per-expert loop with individual command buffers");
+    println!("  Grouped:   ExpertGroup::grouped_forward() — single CB for all experts");
+    println!("  Single-CB: forward_into_cb + fused_silu_mul_into_cb in one command buffer");
     println!("  GatherMM:  single batched GPU call per projection (gate, up, down)");
     println!("  EP-2 sim:  half the experts (4 of 8) on a single rank");
     #[cfg(feature = "distributed")]
@@ -591,8 +670,8 @@ fn main() {
         }
     }
     println!();
-    println!("  Key comparison: PerExpert has O(E) GPU syncs per forward,");
-    println!("  GatherMM reduces to O(1) syncs per projection stage.");
+    println!("  Key comparison: Single-CB encodes all expert GEMMs + SwiGLU into one");
+    println!("  command buffer (1 commit). Old PerExpert had O(E) individual CB commits.");
     println!("  EP-2 halves the compute but adds network dispatch/combine overhead.");
     #[cfg(feature = "distributed")]
     {

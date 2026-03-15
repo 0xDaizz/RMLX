@@ -369,7 +369,21 @@ impl ExpertGroup {
             output: Array,
         }
 
+        // ── Bulk allocation: 4 buffers instead of 4 × num_experts ──
+        // Compute total tokens across all experts to allocate one contiguous
+        // buffer per intermediate type, then create views for each expert.
+        let total_tokens: usize = expert_inputs
+            .iter()
+            .map(|(_, input)| input.shape()[0])
+            .sum();
+
+        let all_gate_out = Array::zeros(dev, &[total_tokens, self.intermediate_dim], dtype);
+        let all_up_out = Array::zeros(dev, &[total_tokens, self.intermediate_dim], dtype);
+        let all_silu_out = Array::zeros(dev, &[total_tokens, self.intermediate_dim], dtype);
+        let all_output = Array::zeros(dev, &[total_tokens, self.hidden_dim], dtype);
+
         let mut work_items: Vec<ExpertWork> = Vec::with_capacity(expert_inputs.len());
+        let mut offset_tokens: usize = 0;
 
         for &(expert_idx, input) in expert_inputs {
             let batch_size = input.shape()[0];
@@ -385,10 +399,33 @@ impl ExpertGroup {
                 ops::copy::copy(registry, input, queue)?
             };
 
-            let gate_out = Array::zeros(dev, &[batch_size, self.intermediate_dim], dtype);
-            let up_out = Array::zeros(dev, &[batch_size, self.intermediate_dim], dtype);
-            let silu_out = Array::zeros(dev, &[batch_size, self.intermediate_dim], dtype);
-            let output = Array::zeros(dev, &[batch_size, self.hidden_dim], dtype);
+            // Create views into the bulk-allocated buffers for this expert's slice.
+            // Byte offset = offset_tokens * dim * elem_size
+            let inter_byte_off = offset_tokens * self.intermediate_dim * elem_size;
+            let hidden_byte_off = offset_tokens * self.hidden_dim * elem_size;
+
+            let gate_out = all_gate_out.view(
+                vec![batch_size, self.intermediate_dim],
+                vec![self.intermediate_dim, 1],
+                inter_byte_off,
+            );
+            let up_out = all_up_out.view(
+                vec![batch_size, self.intermediate_dim],
+                vec![self.intermediate_dim, 1],
+                inter_byte_off,
+            );
+            let silu_out = all_silu_out.view(
+                vec![batch_size, self.intermediate_dim],
+                vec![self.intermediate_dim, 1],
+                inter_byte_off,
+            );
+            let output = all_output.view(
+                vec![batch_size, self.hidden_dim],
+                vec![self.hidden_dim, 1],
+                hidden_byte_off,
+            );
+
+            offset_tokens += batch_size;
 
             work_items.push(ExpertWork {
                 expert_idx,
@@ -402,7 +439,8 @@ impl ExpertGroup {
         }
 
         // ── Single command buffer for ALL experts ──
-        let cb = queue.commandBuffer().unwrap();
+        // Use unretained references to avoid retain/release overhead per resource.
+        let cb = queue.commandBufferWithUnretainedReferences().unwrap();
 
         for item in &work_items {
             let m = item.batch_size as u32;

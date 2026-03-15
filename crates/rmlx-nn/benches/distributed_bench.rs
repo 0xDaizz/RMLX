@@ -5,7 +5,7 @@
 //! Distributed Tensor Parallel Benchmark (Phase I-1 / J-7)
 //!
 //! Measures single-layer transformer forward pass with and without TP overhead,
-//! using Mixtral 8x7B-like config (hidden=4096, intermediate=14336, 32 heads, 8 KV heads).
+//! using Qwen 3.5 MoE A22B config (hidden=3584, intermediate=18944, 28 heads, 4 KV heads).
 //!
 //! All benchmarks use **f16** dtype (realistic inference precision) with RoPE and
 //! a KV cache pre-filled with 128 tokens (matching MLX benchmark workload). Includes:
@@ -18,6 +18,8 @@
 //!    (distributed feature required)
 //! 7. **Real RDMA allreduce**: actual 2-node allreduce over TB5 RDMA
 //!    (requires RMLX_RANK, RMLX_WORLD_SIZE, RMLX_COORDINATOR env vars)
+//! 9. **Prefill single-CB**: `forward_prefill_into_cb()` at M=128,512 (full weights)
+//! 10. **Prefill sharded**: same but with TP=2 half-size weights (no communication)
 //!
 //! Run locally (single-node):
 //!   cargo bench -p rmlx-nn --bench distributed_bench
@@ -39,17 +41,19 @@ use rmlx_nn::{
     Attention, AttentionConfig, FeedForward, LayerKvCache, Linear, LinearConfig, TransformerBlock,
 };
 
-// ─── Mixtral 8x7B-like config (dense attention + gated FFN per expert) ───
-const HIDDEN_SIZE: usize = 4096;
-const NUM_HEADS: usize = 32;
-const NUM_KV_HEADS: usize = 8;
+// ─── Qwen 3.5 MoE A22B config (dense attention + gated FFN per expert) ───
+const HIDDEN_SIZE: usize = 3584;
+const NUM_HEADS: usize = 28;
+const NUM_KV_HEADS: usize = 4;
 const HEAD_DIM: usize = 128;
-const INTERMEDIATE_DIM: usize = 14336;
+const INTERMEDIATE_DIM: usize = 18944;
 const SEQ_LEN: usize = 1; // decode token
-const RMS_NORM_EPS: f32 = 1e-5;
-const ROPE_THETA: f32 = 10000.0;
+const RMS_NORM_EPS: f32 = 1e-6;
+const ROPE_THETA: f32 = 1000000.0;
 const MAX_SEQ_LEN: usize = 2048;
 const KV_CACHE_LEN: usize = 128; // pre-filled KV cache length (matches MLX benchmark)
+
+const PREFILL_SEQ_LENS: &[usize] = &[128, 512];
 
 const WARMUP_ITERS: usize = 5;
 const BENCH_ITERS: usize = 50;
@@ -240,7 +244,7 @@ fn build_transformer_block(
         num_kv_heads: NUM_KV_HEADS,
         head_dim: HEAD_DIM,
         max_seq_len: 2048,
-        rope_theta: 10000.0,
+        rope_theta: 1000000.0,
     };
     let attention =
         Attention::from_layers(attn_config, q_proj, k_proj, v_proj, o_proj).expect("attention");
@@ -291,7 +295,7 @@ fn build_sharded_transformer_block(
         num_kv_heads: NUM_KV_HEADS / 2,
         head_dim: HEAD_DIM,
         max_seq_len: 2048,
-        rope_theta: 10000.0,
+        rope_theta: 1000000.0,
     };
     let attention =
         Attention::from_layers(attn_config, q_proj, k_proj, v_proj, o_proj).expect("attention");
@@ -451,13 +455,161 @@ fn bench_sharded_compute(
 }
 
 // ---------------------------------------------------------------------------
+// Benchmark: prefill forward (single-CB, full weights)
+// ---------------------------------------------------------------------------
+
+fn bench_prefill_single_cb(
+    block: &TransformerBlock,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    registry: &KernelRegistry,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> Vec<(usize, Stats)> {
+    println!("\n=== Prefill: forward_prefill_into_cb() — single CB ===");
+    let mut results = Vec::new();
+
+    for &seq_len in PREFILL_SEQ_LENS {
+        let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42 + seq_len as u64);
+        let mut cache =
+            LayerKvCache::preallocated(device, NUM_KV_HEADS, HEAD_DIM, MAX_SEQ_LEN, DType::Float16);
+
+        let label = format!("prefill_single_cb (M={})", seq_len);
+        let stats = run_bench(&label, || {
+            cache.seq_len = 0; // reset for each iteration — prefill starts empty
+            let cb = queue.commandBuffer().unwrap();
+            let _output = block
+                .forward_prefill_into_cb(
+                    &input,
+                    Some(cos_freqs),
+                    Some(sin_freqs),
+                    None,
+                    &mut cache,
+                    registry,
+                    &cb,
+                )
+                .expect("prefill forward");
+            cb.commit();
+            cb.waitUntilCompleted();
+            drop(_output);
+        });
+        results.push((seq_len, stats));
+    }
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: prefill forward (TP=2, sharded weights, single-CB)
+// ---------------------------------------------------------------------------
+
+fn bench_prefill_sharded_cb(
+    block: &TransformerBlock,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    registry: &KernelRegistry,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+) -> Vec<(usize, Stats)> {
+    println!(
+        "\n=== Prefill: forward_prefill_into_cb() — sharded (TP=2, half weights, no allreduce) ==="
+    );
+    let mut results = Vec::new();
+
+    for &seq_len in PREFILL_SEQ_LENS {
+        let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42 + seq_len as u64);
+        let mut cache = LayerKvCache::preallocated(
+            device,
+            NUM_KV_HEADS / 2,
+            HEAD_DIM,
+            MAX_SEQ_LEN,
+            DType::Float16,
+        );
+
+        let label = format!("prefill_sharded_cb (M={})", seq_len);
+        let stats = run_bench(&label, || {
+            cache.seq_len = 0;
+            let cb = queue.commandBuffer().unwrap();
+            let _output = block
+                .forward_prefill_into_cb(
+                    &input,
+                    Some(cos_freqs),
+                    Some(sin_freqs),
+                    None,
+                    &mut cache,
+                    registry,
+                    &cb,
+                )
+                .expect("prefill sharded forward");
+            cb.commit();
+            cb.waitUntilCompleted();
+            drop(_output);
+        });
+        results.push((seq_len, stats));
+    }
+    results
+}
+
+// ---------------------------------------------------------------------------
+// Benchmark: prefill forward (TP=2, real RDMA, Split-CB)
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "distributed")]
+#[allow(clippy::too_many_arguments)]
+fn bench_tp_prefill_split_cb(
+    block: &TransformerBlock,
+    cos_freqs: &Array,
+    sin_freqs: &Array,
+    registry: &KernelRegistry,
+    queue: &ProtocolObject<dyn objc2_metal::MTLCommandQueue>,
+    device: &ProtocolObject<dyn objc2_metal::MTLDevice>,
+    dist: &BenchDistCtx,
+) -> Vec<(usize, Stats)> {
+    println!(
+        "\n=== Prefill: forward_prefill_with_group_split_cb() — Split-CB (rank={}, world_size={}) ===",
+        dist.rank, dist.world_size
+    );
+    let mut results = Vec::new();
+
+    for &seq_len in PREFILL_SEQ_LENS {
+        let input = rand_array(device, &[seq_len, HIDDEN_SIZE], 42 + seq_len as u64);
+        let mut cache = LayerKvCache::preallocated(
+            device,
+            NUM_KV_HEADS / 2,
+            HEAD_DIM,
+            MAX_SEQ_LEN,
+            DType::Float16,
+        );
+
+        let label = format!("prefill_tp_split_cb (M={})", seq_len);
+        let stats = run_bench(&label, || {
+            cache.seq_len = 0;
+            let _ = block
+                .forward_prefill_with_group_split_cb(
+                    &input,
+                    Some(cos_freqs),
+                    Some(sin_freqs),
+                    None,
+                    &mut cache,
+                    &dist.group,
+                    device,
+                    registry,
+                    queue,
+                )
+                .expect("prefill tp split-cb forward");
+        });
+        results.push((seq_len, stats));
+    }
+    results
+}
+
+// ---------------------------------------------------------------------------
 // Benchmark: weight sharding overhead
 // ---------------------------------------------------------------------------
 
 fn bench_weight_sharding(device: &ProtocolObject<dyn objc2_metal::MTLDevice>) -> Stats {
     use rmlx_nn::{ColumnParallelLinear, RowParallelLinear};
 
-    println!("\n=== Weight sharding overhead (Mixtral-like, TP=2) ===");
+    println!("\n=== Weight sharding overhead (Qwen 3.5 MoE A22B, TP=2) ===");
 
     let q_weight = rand_array(device, &[HIDDEN_SIZE, HIDDEN_SIZE], 100);
     let k_weight = rand_array(device, &[NUM_KV_HEADS * HEAD_DIM, HIDDEN_SIZE], 101);
@@ -671,7 +823,7 @@ fn bench_parallel_linear(
 
         let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
 
-        let col_stats = run_bench("ColumnParallel [4096->7168] (RDMA)", || {
+        let col_stats = run_bench("ColumnParallel [3584->9472] (RDMA)", || {
             let _ = col_layer
                 .forward_with_group(&input, &dist.group, registry, queue)
                 .expect("col forward");
@@ -693,7 +845,7 @@ fn bench_parallel_linear(
 
         let row_input = rand_array(device, &[SEQ_LEN, shard_in], 43);
 
-        let row_stats = run_bench("RowParallel    [7168->4096] (RDMA)", || {
+        let row_stats = run_bench("RowParallel    [9472->3584] (RDMA)", || {
             let _ = row_layer
                 .forward_with_group(&row_input, &dist.group, registry, queue)
                 .expect("row forward");
@@ -712,7 +864,7 @@ fn bench_parallel_linear(
 
         let input = rand_array(device, &[SEQ_LEN, HIDDEN_SIZE], 42);
 
-        let col_stats = run_bench("ColumnParallel [4096->7168] (half)", || {
+        let col_stats = run_bench("ColumnParallel [3584->9472] (half)", || {
             let _ = col_layer
                 .forward_with_group(&input, &dist.group, registry, queue)
                 .expect("col forward");
@@ -726,7 +878,7 @@ fn bench_parallel_linear(
 
         let row_input = rand_array(device, &[SEQ_LEN, INTERMEDIATE_DIM / 2], 43);
 
-        let row_stats = run_bench("RowParallel    [7168->4096] (half)", || {
+        let row_stats = run_bench("RowParallel    [9472->3584] (half)", || {
             let _ = row_layer
                 .forward_with_group(&row_input, &dist.group, registry, queue)
                 .expect("row forward");
@@ -847,7 +999,7 @@ fn main() {
     #[cfg(feature = "distributed")]
     let dist = init_distributed();
 
-    println!("\nConfig: Mixtral 8x7B-like single expert layer");
+    println!("\nConfig: Qwen 3.5 MoE A22B single expert layer");
     println!(
         "  hidden={}, heads={}/{}, head_dim={}, intermediate={}, seq_len={}",
         HIDDEN_SIZE, NUM_HEADS, NUM_KV_HEADS, HEAD_DIM, INTERMEDIATE_DIM, SEQ_LEN
@@ -956,6 +1108,36 @@ fn main() {
             device,
             &registry,
             &queue,
+            &dist,
+        ))
+    } else {
+        None
+    };
+
+    // ── 9. Prefill: single-CB (full weights) ──
+    let prefill_full_results =
+        bench_prefill_single_cb(&block, &cos_freqs, &sin_freqs, &registry, &queue, device);
+
+    // ── 10. Prefill: sharded (TP=2 half weights, no allreduce) ──
+    let prefill_sharded_results = bench_prefill_sharded_cb(
+        &sharded_block,
+        &cos_freqs,
+        &sin_freqs,
+        &registry,
+        &queue,
+        device,
+    );
+
+    // ── 11. Prefill: TP Split-CB (real RDMA) ──
+    #[cfg(feature = "distributed")]
+    let _prefill_tp_results = if dist.is_multi_rank {
+        Some(bench_tp_prefill_split_cb(
+            &sharded_block,
+            &cos_freqs,
+            &sin_freqs,
+            &registry,
+            &queue,
+            device,
             &dist,
         ))
     } else {
@@ -1114,6 +1296,42 @@ fn main() {
         println!();
         println!("  (Enable `distributed` feature for allreduce + ColumnParallel/RowParallel benchmarks)");
         println!("  cargo bench -p rmlx-nn --bench distributed_bench --features distributed");
+    }
+
+    // ── Prefill summary ──
+    println!();
+    println!("  Prefill (forward_prefill_into_cb):");
+    for (seq_len, stats) in &prefill_full_results {
+        println!(
+            "  {:44} {:>8.1} us",
+            format!("  Full weights (M={})", seq_len),
+            stats.mean
+        );
+    }
+    for (seq_len, stats) in &prefill_sharded_results {
+        println!(
+            "  {:44} {:>8.1} us",
+            format!("  Sharded TP=2 (M={})", seq_len),
+            stats.mean
+        );
+    }
+    // Compare prefill full vs sharded for each seq_len
+    for ((seq_len, full_s), (_, shard_s)) in prefill_full_results
+        .iter()
+        .zip(prefill_sharded_results.iter())
+    {
+        let saving = full_s.mean - shard_s.mean;
+        let pct = if full_s.mean > 0.0 {
+            saving / full_s.mean * 100.0
+        } else {
+            0.0
+        };
+        println!(
+            "  {:44} {:>8.1} us ({:.1}%)",
+            format!("  TP=2 compute saving (M={})", seq_len),
+            saving,
+            pct
+        );
     }
 
     println!();

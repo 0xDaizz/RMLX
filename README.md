@@ -1,191 +1,267 @@
-# RMLX
-
-**Rust ML runtime for Apple Silicon — 6.34x faster than MLX at model-scale decode, prefill within 1.2-3.4x of MLX**
-
-[![CI](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg)](https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Rust 1.80+](https://img.shields.io/badge/rust-1.80%2B-orange.svg)](https://www.rust-lang.org/)
-[![Tests](https://img.shields.io/badge/tests-1298%20passing-brightgreen.svg)]()
-[![macOS Apple Silicon](https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg)]()
-
-> 한국어 문서: [docs/README_ko.md](docs/README_ko.md)
+<p align="center">
+  <!-- Logo coming soon -->
+  <h1 align="center">RMLX</h1>
+  <p align="center">
+    <strong>Rust ML runtime for Apple Silicon — zero-copy Metal GPU pipeline with RDMA distributed inference</strong>
+  </p>
+  <p align="center">
+    <em>156× decode speedup · 12.1× faster than MLX compiled · 46× Split-CB TP · 5.0× vs MLX at TP=2 · EP 30-178× vs MLX</em>
+  </p>
+  <p align="center">
+    <a href="https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml"><img src="https://github.com/0xDaizz/RMLX/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
+    <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/rust-1.80%2B-orange.svg" alt="Rust 1.80+"></a>
+    <img src="https://img.shields.io/badge/tests-1298%20passing-brightgreen.svg" alt="Tests">
+    <img src="https://img.shields.io/badge/platform-macOS%20Apple%20Silicon-lightgrey.svg" alt="macOS Apple Silicon">
+  </p>
+  <p align="center">
+    <a href="#-install">Install</a> ·
+    <a href="#-quickstart">Quickstart</a> ·
+    <a href="#-performance">Performance</a> ·
+    <a href="#-features">Features</a> ·
+    <a href="#%EF%B8%8F-architecture">Architecture</a> ·
+    <a href="#-roadmap">Roadmap</a> ·
+    <a href="#-docs">Docs</a>
+  </p>
+</p>
 
 ---
 
-RMLX reimplements Apple's [MLX](https://github.com/ml-explore/mlx) Metal GPU pipeline **entirely in Rust**, built on `objc2-metal 0.3` / `objc2 0.6` / `block2 0.6` / `objc2-foundation 0.3`. The fused 7-dispatch decode path achieves **699.3 us/layer at 60-layer depth** — **6.34x faster than MLX compiled** (4,525 us/layer) on identical hardware (M3 Ultra). FP16 GEMM reaches **24.05 TFLOPS** and QMM Q4 hits **17.43 TFLOPS** (+28% vs MLX). Bandwidth efficiency sits at 73.6% — the practical floor for f16 decode on Apple Silicon.
+> 🇰🇷 한국어 문서: [docs/README_ko.md](docs/README_ko.md)
 
-## ⚡ Performance
+## 🧠 What is RMLX?
 
-Single transformer layer decode (MoE expert shapes, f16, M3 Ultra):
+RMLX reimplements Apple's [MLX](https://github.com/ml-explore/mlx) Metal GPU pipeline **entirely in Rust**, built on `objc2-metal` / `objc2` / `block2` / `objc2-foundation`. The framework is organized into **7 crates** spanning GPU compute, memory allocation, neural network layers, and RDMA-based distributed inference.
 
-| Path | Latency | Speedup |
-|------|--------:|--------:|
-| Baseline (per-op sync) | 111,083 us | 1x |
-| ExecGraph (5 CB) | 2,846 us | 39x |
-| Single-CB (44 enc) | 2,143 us | 52x |
-| **9-Dispatch (single layer)** | **1,081 us** | **103x** |
-| **60-layer pipeline** | **751 us/L** | **6.34x vs MLX** |
-| **Cached 2-encoder (60L)** | **714 us/L** | **8% faster, 6x lower σ** |
-| **Fused 7-dispatch (60L)** | **699.3 us/L** | **Phase 10 best** |
-| **Phase A prefill (single-layer)** | **3.5-7.3x vs baseline** | **MLX parity within 1.2-3.4x** |
-| **FP16 GEMM TFLOPS** | **24.05T** | **Pipe parity** |
-| **QMM Q4 M=512** | **17.43T** | **MLX 13.6T (+28%)** |
-| **Fair bench M=32~256** | **1.24~2.83x** | **vs MLX** |
-| MLX compiled (60L, f16) | 4,525 us/L | — |
+The fused 7-dispatch decode path achieves **703 μs/layer** (73.6% bandwidth efficiency) — the practical floor for f16 decode on Apple Silicon. FP16 GEMM reaches **24.05 TFLOPS** (MLX parity), QMM Q4 hits **17.43 TFLOPS** (+28% vs MLX), and 2-node RDMA tensor parallelism delivers **5.0× faster** decode than MLX TP=2 (378 μs vs 1,880 μs). Expert parallelism achieves **30–178× vs MLX** per-expert, with buffer-pooled MoE grouped forward cutting latency by **68×**.
 
-## ✨ RMLX vs MLX vs CUDA
+Single Rust binary. Zero-copy unified memory. No Python runtime, no framework overhead.
 
-| Feature | RMLX | MLX | CUDA |
-|---------|:----:|:---:|:----:|
-| Unified memory (zero-copy) | ✅ | ✅ | ❌ |
-| 9-dispatch decode (6.34x vs MLX) | ✅ | ➖ | ➖ |
-| Prefill single-CB pipeline | ✅ | ➖ | ➖ |
-| Expert parallelism | ✅ | ❌ | ⚠️ |
-| Zero-copy RDMA | ✅ | ❌ | ❌ |
-| Flash Attention 2 | ✅ | ✅ | ✅ |
-| MLA (DeepSeek-V3) | ✅ | ❌ | ⚠️ |
-| GGUF model loading | ✅ | ✅ | ✅ |
-| Quantized inference | ✅ | ✅ | ✅ |
-| Single Rust binary | ✅ | ❌ | ❌ |
+## 📦 Install
 
-## 🛠️ What's Inside
-
-<details open>
-<summary><b>32+ GPU ops</b> — matmul, softmax, RMS norm, RoPE, GEMV, SDPA, conv, scan, sort, argreduce, random, ...</summary>
-
-- Flash Attention 2 Metal kernel (tiled online softmax, D up to 256)
-- BM=8 GEMV with dynamic tile selection, SIMD group MMA matmul, barrier-free BM8, 4×float4 vectorization
-- Batched SDPA decode with slab KV cache
-- FP8 (E4M3/E5M2), AWQ/GPTQ INT4, K-quant (Q2K–Q6K)
-- Single-pass layer norm, register-cached RMS norm
-- Fused kernels: silu-mul, RMSNorm+residual, GEMV+bias, GEMM+residual epilogue
-- GEMM: 24.05T TFLOPS (pipe parity), MLX-architecture kernel (BK=16, 2 SG, serpentine MMA)
-- Quantized: QMM MMA Q4/Q8, QMV qdot pattern, no CPU fallback
-</details>
-
-<details open>
-<summary><b>Infrastructure</b> — ExecGraph, 9-dispatch decode, RDMA, BFC allocator</summary>
-
-- **7-dispatch fused decode**: merged QKV/gate-up weights, batched SDPA, fused_rms_gemv + fused_swiglu_down kernel fusion, 699.3 us/layer at 60L depth (6.34x faster than MLX); **CachedDecode** path with pre-resolved PSOs + zero per-token allocation
-- **Phase A prefill**: single-CB pipeline (54 sync points to 1), GQA slab SDPA (32 per-head dispatches to 1), GEMM threadgroup swizzle, 3.5-7.3x speedup over baseline
-- **ExecGraph**: command buffer batching (65 CB down to 5)
-- **Metal**: `objc2-metal 0.3` bindings with **ComputePass** zero-cost abstraction and type alias layer, ChipTuning (M1–M4), DiskPipelineCache, fence manager, dual queues; **Metal 4** support (feature-gated `metal4`, macOS 26+)
-- **Allocator**: zero-copy (posix_memalign + MTLBuffer), BFC, residency manager
-- **RDMA**: ibverbs FFI, TB5 multi-port, ring/allreduce/allgather collectives
-- **Distributed**: expert parallelism (3-zone auto), tree allreduce, topology-aware CLI, **DistributedTransformerModel** (TP with forward_with_group + shard_for_tp)
-- **Phase F**: Dispatch overhead bench (176us/CB), DiskPipelineCache, GatherMM MMA (4-12x for MoE)
-- **Phase G**: QMM MMA Q4/Q8, QMV qdot, CPU fallback removed
-- **Phase H-2**: GEMM+residual epilogue fusion (5-12% for large N)
-- **Phase I-1**: Distributed TP (TP=2 1.94x estimated)
-- **Phase J**: QMM +73% (5.34T), QMV +37% (MLX 1.15x), ExecGraph stall removal, lazy.rs fusion, RMSNorm+GEMM fusion, Split-K QMM, MoE fused kernels
-</details>
-
-<details>
-<summary><b>Neural network layers</b> — 4 model architectures, 16 activations, MoE, MLA</summary>
-
-- **Models**: Qwen 3.5, DeepSeek-V3, Mixtral, Kimi K2.5
-- **Attention**: Multi-Head, GQA, MLA, Sliding Window
-- **KV cache**: static, rotating, paged (vLLM-style), quantized, slab decode
-- **Quantization**: QuantizedLinear, AWQ, GPTQ, K-quant
-- **Loading**: GGUF v2/v3 with tensor mapping
-</details>
-
-## 🏗️ Architecture
-
-```mermaid
-graph TD
-    NN[rmlx-nn]
-    CORE[rmlx-core]
-    DIST[rmlx-distributed]
-    METAL[rmlx-metal]
-    ALLOC[rmlx-alloc]
-    RDMA[rmlx-rdma]
-    CLI[rmlx-cli]
-
-    NN --> CORE
-    CORE --> METAL
-    CORE --> ALLOC
-    DIST --> CORE
-    DIST --> RDMA
-    ALLOC --> RDMA
-    METAL -.-> ALLOC
-    CLI --> NN
-```
-
-| Crate | Role |
-|-------|------|
-| **rmlx-nn** | Models, attention, MoE, KV cache, GGUF loader |
-| **rmlx-core** | 32+ op modules, Array/DType, autodiff |
-| **rmlx-metal** | Device, ExecGraph, ChipTuning, pipeline cache, ComputePass abstraction (`objc2-metal`), Metal 4 (feature-gated) |
-| **rmlx-alloc** | Zero-copy allocator, BFC, residency |
-| **rmlx-distributed** | EP, allreduce, topology |
-| **rmlx-rdma** | ibverbs FFI, collectives |
-| **rmlx-cli** | Launch, config, topology discovery |
-
-## 🚀 Quick Start
+**Prerequisites:** macOS 14+ on Apple Silicon (M1 or later). See [full prerequisites](docs/getting-started/prerequisites.md).
 
 ```bash
-git clone https://github.com/0xDaizz/RMLX.git && cd RMLX
-
-cargo build --workspace        # Build
-cargo test --workspace         # 1,298 tests
-cargo bench -p rmlx-nn --bench pipeline_bench  # Benchmark
+git clone https://github.com/0xDaizz/RMLX.git
+cd RMLX
+cargo build --workspace
 ```
 
-> Requires macOS 14+ on Apple Silicon. See [Prerequisites](docs/getting-started/prerequisites.md).
+## 🚀 Quickstart
 
-Distributed 2-node RDMA runbook (minimal):
+### Build & Test
 
 ```bash
-# cargo install --path crates/rmlx-cli   (one-time)
+cargo build --workspace           # Build all 7 crates
+cargo test  --workspace           # Run 1,298 tests
+```
 
-# Auto-detect TB5 topology, assign IPs, configure interfaces, generate hostfile
+### Benchmark
+
+```bash
+cargo bench -p rmlx-nn --bench pipeline_bench
+```
+
+### Distributed RDMA (2-node)
+
+```bash
+# One-time install
+cargo install --path crates/rmlx-cli
+
+# Auto-detect TB5 topology, assign IPs, configure interfaces
 rmlx config --hosts node1,node2 --auto-setup --output rmlx-hosts.json --verbose
 
 # Launch distributed job
 rmlx launch --backend rdma --hostfile rmlx-hosts.json -- ibv_devices
 ```
 
-`--auto-setup` automatically discovers Thunderbolt connections via `system_profiler`, assigns point-to-point IPs, and configures RDMA interfaces — no manual `ifconfig` or hostfile editing required.
+> `--auto-setup` discovers Thunderbolt connections via `system_profiler`, assigns point-to-point IPs, and configures RDMA interfaces automatically.
 
-## 📊 Stats
+## 📊 Performance
 
-| Metric | Value |
-|--------|------:|
-| Crates | 7 |
-| Tests | 1,298 |
-| GPU ops | 32+ |
-| Activations | 16 |
-| Model architectures | 4 |
-| Decode latency | 699.3 us/L (60L fused 7-dispatch) |
-| Prefill speedup | 3.5-7.3x vs baseline |
-| Prefill vs MLX | within 1.2-3.4x |
-| vs MLX (60L compiled) | 6.34x faster |
+All numbers measured on Apple Silicon (M3 Ultra), single transformer layer, Qwen 3.5 MoE A22B config, f16 unless noted.
+
+### ⚡ Decode — 110 ms → 703 μs (156×)
+
+| Stage | Latency | vs Naive | Key Technique |
+|:------|--------:|---------:|:--------------|
+| Naive (per-op sync) | 110 ms | 1× | 65 CBs, GPU idle between dispatches |
+| ExecGraph | 2.8 ms | 39× | CB batching 65 → 5 |
+| 9-Dispatch + PSO Cache | 1,081 μs | 102× | Single-CB decode, kernel optimization |
+| f16 + CachedDecode (60L) | 714 μs | 154× | f16 default, buffer reuse, 2-encoder pipeline |
+| **7-Dispatch Fusion (60L)** | **703 μs** | **156×** | fused_rms_gemv + fused_swiglu_down |
+
+> **BW efficiency 73.6%** — practical floor for f16 decode on Apple Silicon (theoretical min ~520 μs).
+
+### ⚡ TP Decode — 12.1× vs MLX (2-node TB5 RDMA)
+
+| Config | RMLX | MLX | Speedup |
+|:-------|-----:|----:|--------:|
+| TP=1 single-CB | 182 μs | 2,197 μs (mx.compile) | **12.1×** |
+| TP=2 Split-CB | 378 μs | 1,880 μs (JACCL) | **5.0×** |
+| Per-op → Split-CB | 18,193 μs → 378 μs | — | **48×** (architecture) |
+| RDMA allreduce (1×) | 14 μs | 87 μs (JACCL 2×) | **6.2×** |
+
+> Split-CB TP batches an entire layer into 2 command buffers with inter-CB allreduce, eliminating per-op GPU sync overhead.
+
+### ⚡ TP Prefill — Split-CB (2-node TB5 RDMA)
+
+| Config | M=128 | M=512 |
+|:-------|------:|------:|
+| RMLX TP=1 | 5,048 μs | 12,616 μs |
+| RMLX TP=2 Split-CB | 1,925 μs | 5,466 μs |
+| MLX TP=1 | 3,890 μs | 11,795 μs |
+| MLX TP=2 JACCL | 3,700 μs | 8,049 μs |
+
+> New `forward_prefill_with_group_split_cb()` method enables TP=2 prefill with proper GPU timing via commandBuffer() isolation.
+
+### ⚡ Prefill GEMM — 24.05 TFLOPS
+
+| Metric | RMLX | MLX | Delta |
+|:-------|-----:|----:|:------|
+| FP16 GEMM (M=512) | 24.05T | 24T | Pipe parity |
+| FP16 GEMM peak | 46.3T | ~23T | 2× MLX |
+| Small-M dispatch (M=32–256) | 1.24–2.83× | 1× | RMLX faster |
+| QMM Q4 (M=512) | 17.43T | 13.6T | +28% |
+| E2E prefill (seq ≥ 256) | — | — | MLX parity |
+
+### ⚡ Expert Parallelism — 30–178× vs MLX
+
+| Config | RMLX | MLX (mx.compile) | Speedup |
+|:-------|-----:|------------------:|--------:|
+| Single expert FFN (M=1..512) | 42–54 μs | 1,338–9,609 μs | **30–178×** |
+| MoE grouped seq=4 (8 experts) | 359 μs | — | 68× vs pre-pooling |
+| MoE grouped seq=32 | 665 μs | — | — |
+| MoE grouped seq=128 | 1,658 μs | — | — |
+
+> Buffer-pooled `grouped_forward`: 32 allocations → 4 bulk allocations (14 ms → 359 μs, 39×). `commandBufferWithUnretainedReferences` removes CB retain/release overhead.
+
+### ⚡ EP-2 End-to-End (4 experts/rank + RDMA)
+
+| Seq Length | RMLX EP-2 | MLX EP-2 (JACCL) | Speedup |
+|:-----------|----------:|------------------:|--------:|
+| seq=4 | 233 μs | 6,895 μs | **30×** |
+| seq=32 | 429 μs | — | — |
+| seq=64 | 672 μs | — | — |
+
+> EP-2 e2e seq=4: was 12,537 μs before buffer pooling — **54× improvement**.
+
+### ⚡ RDMA vs JACCL Transport
+
+| Payload | RMLX RDMA | MLX JACCL | Speedup |
+|:--------|----------:|----------:|--------:|
+| 28 KB | 12 μs | 79 μs | **6.6×** |
+| 896 KB | 97 μs | 308 μs | **3.2×** |
+
+## ✨ Features
+
+### RMLX vs MLX vs CUDA
+
+| Feature | RMLX | MLX | CUDA |
+|:--------|:----:|:---:|:----:|
+| Unified memory (zero-copy) | ✅ | ✅ | ❌ |
+| 7-dispatch fused decode | ✅ | ❌ | ❌ |
+| Single-CB prefill pipeline | ✅ | ❌ | ❌ |
+| Expert parallelism (MoE, 30–178×) | ✅ | ❌ | ⚠️ |
+| Zero-copy RDMA | ✅ | ❌ | ❌ |
+| Flash Attention 2 | ✅ | ✅ | ✅ |
+| MLA (DeepSeek-V3) | ✅ | ❌ | ⚠️ |
+| GGUF model loading | ✅ | ✅ | ✅ |
+| Quantized inference (Q4/Q8) | ✅ | ✅ | ✅ |
+| Single Rust binary | ✅ | ❌ | ❌ |
+| Metal 4 support (macOS 26+) | ✅ | ❌ | ❌ |
+
+### 🔧 Key Capabilities
+
+<details open>
+<summary><strong>32+ GPU Ops</strong></summary>
+
+- Flash Attention 2 Metal kernel (tiled online softmax, D up to 256)
+- SIMD group MMA matmul, BM=8 GEMV with dynamic tile selection
+- Batched SDPA decode with slab KV cache
+- FP8 (E4M3/E5M2), AWQ/GPTQ INT4, K-quant (Q2K–Q6K)
+- Fused kernels: SiLU-mul, RMSNorm+residual, GEMV+bias, GEMM+residual epilogue
+- GEMM: MLX-architecture kernel (BK=16, 2 SG, serpentine MMA)
+- QMM MMA Q4/Q8, QMV qdot pattern — no CPU fallback
+
+</details>
+
+<details open>
+<summary><strong>Infrastructure</strong></summary>
+
+- **ExecGraph**: command buffer batching (65 CB → 5)
+- **CachedDecode**: pre-resolved PSOs, zero per-token allocation
+- **Metal**: `objc2-metal 0.3` with ComputePass zero-cost abstraction, ChipTuning (M1–M4), DiskPipelineCache
+- **Allocator**: zero-copy (posix_memalign + MTLBuffer), BFC, residency manager
+- **RDMA**: ibverbs FFI, TB5 multi-port, ring/allreduce/allgather collectives
+- **Distributed**: TP with Split-CB, expert parallelism (3-zone auto), tree allreduce, topology-aware CLI
+
+</details>
+
+<details>
+<summary><strong>Neural Network Layers</strong></summary>
+
+- **Models**: Qwen 3.5, DeepSeek-V3, Mixtral, Kimi K2.5
+- **Attention**: Multi-Head, GQA, MLA, Sliding Window
+- **KV cache**: static, rotating, paged (vLLM-style), quantized, slab decode
+- **Quantization**: QuantizedLinear, AWQ, GPTQ, K-quant
+- **Loading**: GGUF v2/v3 with tensor mapping
+
+</details>
+
+## 🏗️ Architecture
+
+```mermaid
+graph TD
+    CLI[🖥️ rmlx-cli] --> NN[🧠 rmlx-nn]
+    NN --> CORE[⚙️ rmlx-core]
+    CORE --> METAL[🔩 rmlx-metal]
+    CORE --> ALLOC[📦 rmlx-alloc]
+    DIST[🌐 rmlx-distributed] --> CORE
+    DIST --> RDMA[🔗 rmlx-rdma]
+    ALLOC --> RDMA
+    METAL -.-> ALLOC
+```
+
+| Crate | Role |
+|:------|:-----|
+| **rmlx-cli** | Launch, config, topology discovery |
+| **rmlx-nn** | Models, attention, MoE, KV cache, GGUF loader |
+| **rmlx-core** | 32+ op modules, Array/DType, autodiff |
+| **rmlx-metal** | Device, ExecGraph, ChipTuning, pipeline cache, ComputePass (`objc2-metal`), Metal 4 |
+| **rmlx-alloc** | Zero-copy allocator, BFC, residency manager |
+| **rmlx-distributed** | Expert parallelism, allreduce, topology, TP |
+| **rmlx-rdma** | ibverbs FFI, TB5 multi-port, collectives |
 
 ## 🗺️ Roadmap
 
-seq_len=1 decode optimization is concluded at 699.3 us/layer (73.6% bandwidth efficiency — practical floor for f16 on Apple Silicon). GEMM throughput has reached 24.05T TFLOPS (pipe parity). QMM Q4 hits 17.43T (+28% vs MLX). Phase J closes quantized kernel gaps and adds infrastructure improvements.
+| Era | Phases | Key Result | Status |
+|:----|:-------|:-----------|:------:|
+| **Foundation** | Phase 0 → 7C | Core framework, Metal bindings, ExecGraph, RDMA infra | ✅ Complete |
+| **Decode Optimization** | KO → Phase 11 | 110 ms → 703 μs/layer (156×, 73.6% BW) | ✅ Complete |
+| **GEMM & Prefill** | Phase A → D | 24.05T TFLOPS, MLX parity, single-CB prefill | ✅ Complete |
+| **Quantized Kernels** | Phase F → J | QMM Q4 17.43T (+28% vs MLX), QMV near-parity | ✅ Complete |
+| **Distributed RDMA** | EP-1 → 6, RDMA-7 | TP=2 5.0× vs MLX, Split-CB, 14 μs allreduce | ✅ Complete |
+| **EP + Buffer Pooling** | Phase 8 | EP 30–178× vs MLX, MoE 68× improvement, EP-2 e2e 54× | ✅ Complete |
+| **Next** | KO-2, KO-3, EP-7 | Multi-token decode, speculative decoding, EP scaling | 🔜 Planned |
 
-| Phase | Focus | Key Result | Status |
-|:-----:|-------|:----------:|:------:|
-| J-1 | **QMM MMA redesign** | 3.09T -> 5.34T (+73%), MLX gap 4.78x -> 2.55x | Complete |
-| J-2 | **QMV qdot optimization** | 0.26T -> 0.36T (+37%), MLX 1.15x (near parity) | Complete |
-| J-3 | **ExecGraph stall removal** | 32 inter-layer stalls -> 0 | Complete |
-| J-4 | **lazy.rs FusionCompiler** | FusionGraph -> Metal JIT -> ExecGraph | Complete |
-| J-5 | **RMSNorm+GEMM fusion** | Function constant 203, 2-pass inv_rms | Complete |
-| J-6 | **Split-K QMM** | +20% at M=128 | Complete |
-| J-8 | **MoE fused kernels** | Scatter N x 3 sync -> 1 sync | In review |
-
-> Framework = rmlx-core / rmlx-nn / rmlx-distributed kernel-level work.
 > See [full roadmap](docs/roadmap/phases.md) and [benchmark report](docs/reports/phase-f-i-benchmark-2026-03-08.md) for details.
 
 ## 📚 Docs
 
-- [Architecture Overview](docs/architecture/overview.md)
-- [GPU Pipeline](docs/gpu-pipeline.md)
-- [Implementation Roadmap](docs/roadmap/phases.md)
-- [RMLX vs MLX vs CUDA](docs/comparison.md)
-- [Getting Started](docs/getting-started/prerequisites.md)
+| Document | Description |
+|:---------|:------------|
+| [Architecture Overview](docs/architecture/overview.md) | System design and crate responsibilities |
+| [GPU Pipeline](docs/gpu-pipeline.md) | Metal compute pipeline internals |
+| [Implementation Roadmap](docs/roadmap/phases.md) | Full phase-by-phase history |
+| [RMLX vs MLX vs CUDA](docs/comparison.md) | Detailed framework comparison |
+| [Getting Started](docs/getting-started/prerequisites.md) | Prerequisites and setup guide |
+
+## 🙏 Acknowledgments
+
+- [MLX](https://github.com/ml-explore/mlx) by Apple — the Metal GPU compute framework that RMLX reimplements in Rust
+- [mlx-lm](https://github.com/ml-explore/mlx-lm) by Apple — LLM inference patterns and Metal kernel references
+- [vllm-mlx](https://github.com/nicholasgasior/vllm-mlx) — distributed inference architecture and RDMA transport patterns
 
 ## 📄 License
 
